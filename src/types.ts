@@ -43,6 +43,7 @@ export interface MessageItem {
   clientTempId?: string;
   conversationId: string;
   senderId: string;
+  recipientId?: string;
   text: string;
   imageId?: string;
   localImageDataUrl?: string; // used while offline/uploading
@@ -52,6 +53,7 @@ export interface MessageItem {
   deliveredAt?: string;
   readAt?: string;
   isDeletedPlaceholder?: boolean;
+  errorMessage?: string;
 }
 
 export interface ConversationItem {

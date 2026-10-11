@@ -529,22 +529,29 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                   </div>
                 </div>
 
-                {/* Retry button if failed */}
+                {/* Retry button and failure diagnostic if failed */}
                 {msg.status === 'failed' && msg.clientTempId && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onSendMessage(conversation.id, msg.text, {
-                        imageDataBase64: msg.localImageDataUrl,
-                        replyToMessageId: msg.replyToMessageId,
-                        retryTempId: msg.clientTempId,
-                      })
-                    }
-                    className="mt-1 text-[11px] font-medium text-[#B91C1C] underline flex items-center gap-1"
-                  >
-                    <RotateCcw className="w-3 h-3" />
-                    <span>Retry sending</span>
-                  </button>
+                  <div className="mt-1.5 max-w-[82%] sm:max-w-[70%] flex flex-col items-end gap-1">
+                    {msg.errorMessage && (
+                      <span className="text-[11px] text-[#B91C1C] bg-[#FEF2F2] border border-[#FECACA] rounded-lg px-2.5 py-1 text-right leading-snug">
+                        {msg.errorMessage}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onSendMessage(conversation.id, msg.text, {
+                          imageDataBase64: msg.localImageDataUrl,
+                          replyToMessageId: msg.replyToMessageId,
+                          retryTempId: msg.clientTempId,
+                        })
+                      }
+                      className="text-[11px] font-semibold text-[#B91C1C] underline flex items-center gap-1 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      <span>Retry sending</span>
+                    </button>
+                  </div>
                 )}
 
                 {/* Contextual Action Bar when message is clicked */}

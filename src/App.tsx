@@ -227,6 +227,28 @@ export default function App() {
     }
   }, [selectedConvId, isOnline, fetchConversationMessages]);
 
+  // Real-time BroadcastChannel listener for instant multi-tab / multi-window synchronization
+  useEffect(() => {
+    if (!token || !currentUser || typeof BroadcastChannel === 'undefined') return;
+    let bc: BroadcastChannel | null = null;
+    try {
+      bc = new BroadcastChannel('lamavi_realtime_sync');
+      bc.onmessage = (event) => {
+        if (event.data && event.data.type === 'state_updated') {
+          fetchAllData();
+          if (selectedConvId) {
+            fetchConversationMessages(selectedConvId);
+          }
+        }
+      };
+    } catch {
+      // ignore if unsupported
+    }
+    return () => {
+      if (bc) bc.close();
+    };
+  }, [token, currentUser?.id, selectedConvId, fetchAllData, fetchConversationMessages]);
+
   // Periodic sync fallback for serverless hosts (e.g. Vercel) where persistent WebSockets may not stay open
   useEffect(() => {
     if (!token || !currentUser || !isOnline) return;
@@ -237,7 +259,7 @@ export default function App() {
           fetchConversationMessages(selectedConvId);
         }
       }
-    }, 6000);
+    }, 3000);
     return () => clearInterval(interval);
   }, [token, currentUser?.id, isOnline, selectedConvId, fetchAllData, fetchConversationMessages]);
 
@@ -456,6 +478,9 @@ export default function App() {
   ) => {
     if (!currentUser || !token || !isOnline) return;
 
+    const activeConvObj = conversations.find((c) => c.id === conversationId);
+    const recipientId = activeConvObj?.recipient?.id;
+
     const clientTempId =
       options?.retryTempId || `temp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
@@ -465,6 +490,7 @@ export default function App() {
       clientTempId,
       conversationId,
       senderId: currentUser.id,
+      recipientId,
       text,
       localImageDataUrl: options?.imageDataBase64,
       replyToMessageId: options?.replyToMessageId,
@@ -502,7 +528,10 @@ export default function App() {
             conversationId,
           }),
         });
-        if (!mediaRes.ok) throw new Error('Image upload failed');
+        if (!mediaRes.ok) {
+          const errPayload = await mediaRes.json().catch(() => ({}));
+          throw new Error(errPayload.error || 'Image upload failed');
+        }
         const mediaData = await mediaRes.json();
         uploadedMediaId = mediaData.mediaId;
       }
@@ -518,11 +547,16 @@ export default function App() {
           imageId: uploadedMediaId,
           replyToMessageId: options?.replyToMessageId,
           clientTempId,
+          recipientId,
+          targetUser: activeConvObj?.recipient,
         }),
       });
 
-      if (!res.ok) throw new Error('Send failed');
-      const { message: confirmedMsg } = await res.json();
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.error || `Message send failed (HTTP ${res.status})`);
+      }
+      const { message: confirmedMsg } = payload;
 
       setMessagesByConv((prev) => {
         const list = (prev[conversationId] || []).filter(
@@ -539,10 +573,13 @@ export default function App() {
       });
 
       fetchAllData();
-    } catch {
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to deliver message.';
       setMessagesByConv((prev) => {
         const list = (prev[conversationId] || []).map((m) =>
-          m.clientTempId === clientTempId ? { ...m, status: 'failed' as const } : m
+          m.clientTempId === clientTempId
+            ? { ...m, status: 'failed' as const, errorMessage }
+            : m
         );
         return { ...prev, [conversationId]: list };
       });

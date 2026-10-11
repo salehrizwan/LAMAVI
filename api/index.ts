@@ -66,6 +66,7 @@ export interface MessageRecord {
   clientTempId?: string;
   conversationId: string;
   senderId: string;
+  recipientId?: string;
   text: string;
   imageId?: string;
   replyToMessageId?: string;
@@ -76,6 +77,16 @@ export interface MessageRecord {
   readAt?: string;
   deletedFor: string[];
   deletedForEveryone: boolean;
+}
+
+export function getDeterministicConversationId(userA: string, userB: string): string {
+  const [first, second] = [String(userA).trim(), String(userB).trim()].sort();
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${first}:${second}`)
+    .digest('hex')
+    .slice(0, 16);
+  return `conv_${digest}`;
 }
 
 export interface MediaRecord {
@@ -342,14 +353,67 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
     }
   }
 
-  const convMap = new Map<string, ConversationRecord>();
+  // Deduplicate conversations by participant pair so User A and User B always resolve to the exact same conversation record
+  const convByPair = new Map<string, ConversationRecord>();
+  const convIdRemap = new Map<string, string>();
   for (const c of [...(base.conversations || []), ...(incoming.conversations || [])]) {
-    convMap.set(c.id, c);
+    if (!c || !Array.isArray(c.participantIds) || c.participantIds.length < 2) continue;
+    const pairKey = [c.participantIds[0], c.participantIds[1]].sort().join(':');
+    const existingConv = convByPair.get(pairKey);
+    if (!existingConv) {
+      convByPair.set(pairKey, {
+        ...c,
+        deletedBy: Array.isArray(c.deletedBy) ? c.deletedBy : [],
+        clearedAt: c.clearedAt || {},
+      });
+      convIdRemap.set(c.id, c.id);
+    } else {
+      convIdRemap.set(c.id, existingConv.id);
+      const mergedUpdatedAt =
+        (c.updatedAt || '') > (existingConv.updatedAt || '')
+          ? c.updatedAt
+          : existingConv.updatedAt;
+      convByPair.set(pairKey, {
+        ...existingConv,
+        updatedAt: mergedUpdatedAt,
+        // If either version is not deleted, keep it visible when updated
+        deletedBy: (c.updatedAt || '') > (existingConv.updatedAt || '')
+          ? c.deletedBy || []
+          : existingConv.deletedBy || [],
+        clearedAt: { ...(existingConv.clearedAt || {}), ...(c.clearedAt || {}) },
+      });
+    }
   }
 
   const msgMap = new Map<string, MessageRecord>();
+  const statusRank: Record<string, number> = { sent: 1, delivered: 2, read: 3 };
   for (const m of [...(base.messages || []), ...(incoming.messages || [])]) {
-    msgMap.set(m.id, m);
+    if (!m || !m.id) continue;
+    const canonicalConvId = convIdRemap.get(m.conversationId) || m.conversationId;
+    const normalizedMsg: MessageRecord = {
+      ...m,
+      conversationId: canonicalConvId,
+      deletedFor: Array.isArray(m.deletedFor) ? m.deletedFor : [],
+      deletedForEveryone: Boolean(m.deletedForEveryone),
+    };
+    const prev = msgMap.get(m.id);
+    if (!prev) {
+      msgMap.set(m.id, normalizedMsg);
+    } else {
+      const bestStatus =
+        (statusRank[normalizedMsg.status] || 1) >= (statusRank[prev.status] || 1)
+          ? normalizedMsg.status
+          : prev.status;
+      msgMap.set(m.id, {
+        ...prev,
+        ...normalizedMsg,
+        status: bestStatus,
+        deliveredAt: normalizedMsg.deliveredAt || prev.deliveredAt,
+        readAt: normalizedMsg.readAt || prev.readAt,
+        deletedForEveryone: prev.deletedForEveryone || normalizedMsg.deletedForEveryone,
+        deletedFor: Array.from(new Set([...(prev.deletedFor || []), ...(normalizedMsg.deletedFor || [])])),
+      });
+    }
   }
 
   const mediaMap = new Map<string, MediaRecord>();
@@ -395,7 +459,7 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
   return cleanParsedDatabase({
     users: Array.from(userMap.values()),
     sessions: Array.from(sessionMap.values()),
-    conversations: Array.from(convMap.values()),
+    conversations: Array.from(convByPair.values()),
     messages: Array.from(msgMap.values()),
     media: Array.from(mediaMap.values()),
     statuses: Array.from(statusMap.values()),
@@ -416,16 +480,16 @@ export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
   if (now < firestoreQuotaBackoffUntilMs) {
     return;
   }
-  const minInterval = force ? 5000 : 30000;
+  const minInterval = force ? 1200 : 10000;
   if (now - lastCloudSyncMs < minInterval) return;
   lastCloudSyncMs = now;
   try {
     const resState = await fetch(FIRESTORE_DOC_URL).catch(() => null);
     if (resState) {
       if (resState.status === 429) {
-        firestoreQuotaBackoffUntilMs = Date.now() + 5 * 60 * 1000; // 5-min circuit breaker on 429 Quota Exceeded
+        firestoreQuotaBackoffUntilMs = Date.now() + 60 * 1000; // 60s circuit breaker on 429 Quota Exceeded
         lastFirestoreQuotaError =
-          'Firebase Firestore free daily read quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Newly created accounts on other serverless instances cannot be fetched from Firestore until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
+          'Firebase Firestore free daily quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Cross-device messages and updates cannot sync until the daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
         return;
       }
       if (resState.status === 403) {
@@ -448,7 +512,10 @@ export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
   }
 }
 
-export async function saveDatabase(data: DatabaseSchema = db, syncMedia = false): Promise<void> {
+export async function saveDatabase(
+  data: DatabaseSchema = db,
+  syncMedia = false
+): Promise<{ ok: boolean; error?: string; status?: number }> {
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -461,8 +528,12 @@ export async function saveDatabase(data: DatabaseSchema = db, syncMedia = false)
   }
 
   // Respect Firestore 429 quota circuit-breaker
-  if (Date.now() < firestoreQuotaBackoffUntilMs) {
-    return;
+  if (Date.now() < firestoreQuotaBackoffUntilMs && lastFirestoreQuotaError) {
+    return {
+      ok: !isVercel,
+      status: 429,
+      error: lastFirestoreQuotaError,
+    };
   }
 
   // IMPORTANT: Await the Firestore write directly (do NOT use setTimeout) so Vercel serverless functions do not freeze before persisting to Firestore!
@@ -503,15 +574,35 @@ export async function saveDatabase(data: DatabaseSchema = db, syncMedia = false)
         }),
       }).catch(() => null);
 
-      if (patchRes && patchRes.status === 429) {
-        firestoreQuotaBackoffUntilMs = Date.now() + 5 * 60 * 1000;
+      if (!patchRes) {
+        return {
+          ok: !isVercel,
+          status: 503,
+          error: 'Could not reach Firebase Firestore to persist data across devices.',
+        };
+      }
+
+      if (patchRes.status === 429) {
+        firestoreQuotaBackoffUntilMs = Date.now() + 60 * 1000;
         lastFirestoreQuotaError =
-          'Firebase Firestore free daily quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89.';
-        return;
+          'Firebase Firestore free daily write/read quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Cross-device messages cannot be saved to Firestore until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
+        return {
+          ok: !isVercel,
+          status: 429,
+          error: lastFirestoreQuotaError,
+        };
       }
-      if (patchRes && patchRes.ok) {
-        lastFirestoreQuotaError = null;
+
+      if (!patchRes.ok) {
+        const errText = await patchRes.text().catch(() => '');
+        return {
+          ok: !isVercel,
+          status: patchRes.status,
+          error: `Firestore write failed (HTTP ${patchRes.status}): ${errText.slice(0, 180)}`,
+        };
       }
+
+      lastFirestoreQuotaError = null;
     }
 
     if (syncMedia) {
@@ -538,8 +629,13 @@ export async function saveDatabase(data: DatabaseSchema = db, syncMedia = false)
         }),
       }).catch(() => {});
     }
-  } catch {
-    // Ignore serialization error
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: !isVercel,
+      status: 500,
+      error: err instanceof Error ? err.message : 'Database write error',
+    };
   }
 }
 
@@ -1808,6 +1904,7 @@ export function createApiApp(
   }
 
   app.get('/api/conversations', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
 
     const now = new Date().toISOString();
@@ -1837,7 +1934,10 @@ export function createApiApp(
     }
     if (anyDelivered) await saveDatabase();
 
-    res.json({ conversations: getConversationsForUser(user.id) });
+    res.json({
+      conversations: getConversationsForUser(user.id),
+      quotaWarning: lastFirestoreQuotaError || undefined,
+    });
   });
 
   app.post('/api/conversations/start', requireAuth, async (req, res) => {
@@ -1926,9 +2026,10 @@ export function createApiApp(
 
     const now = new Date().toISOString();
     if (!conv) {
+      const sortedPair = [user.id, recipient.id].sort() as [string, string];
       conv = {
-        id: `conv_${crypto.randomBytes(8).toString('hex')}`,
-        participantIds: [user.id, recipient.id],
+        id: getDeterministicConversationId(user.id, recipient.id),
+        participantIds: sortedPair,
         createdAt: now,
         updatedAt: now,
         deletedBy: [],
@@ -1948,12 +2049,25 @@ export function createApiApp(
   app.get(
     '/api/conversations/:conversationId/messages',
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
+      await ensureCloudDatabaseLoaded(true);
       purgeExpiredRecords();
       const user = (req as express.Request & { user: UserRecord }).user;
-      const conv = db.conversations.find(
-        (c) => c.id === req.params.conversationId
-      );
+      const requestedConvId = req.params.conversationId;
+      let conv = db.conversations.find((c) => c.id === requestedConvId);
+
+      // If conversation ID was deterministic or alternate pair conversation exists, resolve by participant pair
+      if (!conv) {
+        const altRecipientId =
+          typeof req.query.recipientId === 'string' ? req.query.recipientId : '';
+        if (altRecipientId) {
+          conv = db.conversations.find(
+            (c) =>
+              c.participantIds.includes(user.id) &&
+              c.participantIds.includes(altRecipientId)
+          );
+        }
+      }
 
       if (!conv || !conv.participantIds.includes(user.id)) {
         res
@@ -1966,14 +2080,18 @@ export function createApiApp(
       const messages = db.messages
         .filter(
           (m) =>
-            m.conversationId === conv.id &&
+            m.conversationId === conv!.id &&
             !m.deletedFor.includes(user.id) &&
             (!clearedAfter || m.createdAt > clearedAfter)
         )
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
         .map((m) => formatMessageForUser(m, user.id));
 
-      res.json({ messages });
+      res.json({
+        messages,
+        conversationId: conv.id,
+        quotaWarning: lastFirestoreQuotaError || undefined,
+      });
     }
   );
 
@@ -1981,10 +2099,78 @@ export function createApiApp(
     '/api/conversations/:conversationId/messages',
     requireAuth,
     async (req, res) => {
+      await ensureCloudDatabaseLoaded(true);
       const user = (req as express.Request & { user: UserRecord }).user;
-      const conv = db.conversations.find(
-        (c) => c.id === req.params.conversationId
-      );
+      const requestedConvId = req.params.conversationId;
+      const { text, imageId, replyToMessageId, clientTempId, recipientId, recipientUser } =
+        req.body || {};
+
+      let conv = db.conversations.find((c) => c.id === requestedConvId);
+
+      // If cold serverless lambda didn't have the conversation record yet, find by pair or reconstruct deterministically
+      if (!conv && recipientId && typeof recipientId === 'string' && recipientId !== user.id) {
+        conv = db.conversations.find(
+          (c) =>
+            c.participantIds.includes(user.id) &&
+            c.participantIds.includes(recipientId)
+        );
+        if (!conv) {
+          let recipientRecord = db.users.find((u) => u.id === recipientId);
+          if (!recipientRecord && recipientUser && recipientUser.id && recipientUser.username) {
+            const nowStr = new Date().toISOString();
+            recipientRecord = {
+              id: String(recipientUser.id),
+              fullName: String(recipientUser.fullName || recipientUser.username),
+              username: String(recipientUser.username).toLowerCase(),
+              email: String(
+                recipientUser.email || `${recipientUser.username}@gmail.com`
+              ).toLowerCase(),
+              passwordSalt: 'sha256_client',
+              passwordHash: '',
+              recoveryCodeSalt: 'sha256_client',
+              recoveryCodeHash: '',
+              bio: String(recipientUser.bio || ''),
+              avatarUrl: String(recipientUser.avatarUrl || ''),
+              createdAt: nowStr,
+              lastSeen: nowStr,
+              isOnline: Boolean(recipientUser.isOnline),
+              usernameChangeTimestamps: [],
+              privacy: {
+                profilePicVisibility: 'everyone',
+                lastSeenVisibility: 'everyone',
+                readReceipts: true,
+                statusPrivacy: 'everyone',
+                whoCanContact: 'everyone',
+              },
+              notifications: {
+                messageAlerts: true,
+                soundEnabled: true,
+                previewText: true,
+              },
+              chatSettings: {
+                enterToSend: true,
+                fontSize: 'medium',
+                autoDownloadImages: true,
+              },
+            };
+            db.users.push(recipientRecord);
+          }
+
+          const nowStr = new Date().toISOString();
+          const sortedPair = [user.id, recipientId].sort() as [string, string];
+          conv = {
+            id: requestedConvId.startsWith('conv_')
+              ? requestedConvId
+              : getDeterministicConversationId(user.id, recipientId),
+            participantIds: sortedPair,
+            createdAt: nowStr,
+            updatedAt: nowStr,
+            deletedBy: [],
+            clearedAt: {},
+          };
+          db.conversations.push(conv);
+        }
+      }
 
       if (!conv || !conv.participantIds.includes(user.id)) {
         res
@@ -2008,7 +2194,6 @@ export function createApiApp(
         return;
       }
 
-      const { text, imageId, replyToMessageId, clientTempId } = req.body || {};
       const cleanText = typeof text === 'string' ? text.trim() : '';
 
       if (!cleanText && !imageId) {
@@ -2019,7 +2204,7 @@ export function createApiApp(
       if (clientTempId && typeof clientTempId === 'string') {
         const existingMsg = db.messages.find(
           (m) =>
-            m.conversationId === conv.id &&
+            m.conversationId === conv!.id &&
             m.senderId === user.id &&
             m.clientTempId === clientTempId
         );
@@ -2042,6 +2227,7 @@ export function createApiApp(
           typeof clientTempId === 'string' ? clientTempId : undefined,
         conversationId: conv.id,
         senderId: user.id,
+        recipientId: otherId,
         text: cleanText,
         imageId: typeof imageId === 'string' ? imageId : undefined,
         replyToMessageId:
@@ -2054,10 +2240,26 @@ export function createApiApp(
         deletedForEveryone: false,
       };
 
+      const prevUpdatedAt = conv.updatedAt;
+      const prevDeletedBy = [...conv.deletedBy];
+
       conv.updatedAt = nowIso;
       conv.deletedBy = [];
       db.messages.push(newMessage);
-      await saveDatabase();
+
+      const saveResult = await saveDatabase();
+      if (!saveResult.ok) {
+        // Rollback in-memory message if persistent backend failed on Vercel so we never report false success
+        db.messages = db.messages.filter((m) => m.id !== newMessage.id);
+        conv.updatedAt = prevUpdatedAt;
+        conv.deletedBy = prevDeletedBy;
+        res.status(saveResult.status || 503).json({
+          error:
+            saveResult.error ||
+            'Failed to persist message to Firebase Firestore. Please retry.',
+        });
+        return;
+      }
 
       sendToUser(otherId, 'message:new', {
         conversationId: conv.id,
@@ -2070,9 +2272,10 @@ export function createApiApp(
         message: formatMessageForUser(newMessage, user.id),
       });
 
-      res
-        .status(201)
-        .json({ message: formatMessageForUser(newMessage, user.id) });
+      res.status(201).json({
+        message: formatMessageForUser(newMessage, user.id),
+        quotaWarning: lastFirestoreQuotaError || undefined,
+      });
     }
   );
 
@@ -2080,6 +2283,7 @@ export function createApiApp(
     '/api/conversations/:conversationId/read',
     requireAuth,
     async (req, res) => {
+      await ensureCloudDatabaseLoaded(true);
       const user = (req as express.Request & { user: UserRecord }).user;
       const conv = db.conversations.find(
         (c) => c.id === req.params.conversationId
@@ -2130,6 +2334,7 @@ export function createApiApp(
   );
 
   app.delete('/api/messages/:messageId', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const mode = req.query.mode === 'everyone' ? 'everyone' : 'me';
     const msg = db.messages.find((m) => m.id === req.params.messageId);
@@ -2183,6 +2388,7 @@ export function createApiApp(
     '/api/conversations/:conversationId/clear',
     requireAuth,
     async (req, res) => {
+      await ensureCloudDatabaseLoaded(true);
       const user = (req as express.Request & { user: UserRecord }).user;
       const conv = db.conversations.find(
         (c) => c.id === req.params.conversationId
@@ -2202,6 +2408,7 @@ export function createApiApp(
     '/api/conversations/:conversationId',
     requireAuth,
     async (req, res) => {
+      await ensureCloudDatabaseLoaded(true);
       const user = (req as express.Request & { user: UserRecord }).user;
       const conv = db.conversations.find(
         (c) => c.id === req.params.conversationId
@@ -2221,7 +2428,8 @@ export function createApiApp(
   );
 
   // --- 24-HOUR STATUS FEATURE ---
-  app.get('/api/statuses', requireAuth, (req, res) => {
+  app.get('/api/statuses', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     purgeExpiredRecords();
     const user = (req as express.Request & { user: UserRecord }).user;
 

@@ -111,6 +111,39 @@ function randomHex(bytes = 8): string {
     .join('');
 }
 
+async function getDeterministicClientConvId(userA: string, userB: string): Promise<string> {
+  const [first, second] = [String(userA).trim(), String(userB).trim()].sort();
+  const digest = await sha256Hex(`${first}:${second}`);
+  return `conv_${digest.slice(0, 16)}`;
+}
+
+// BroadcastChannel for instant zero-latency real-time sync across tabs/windows on the same device
+const lamaviBroadcast =
+  typeof window !== 'undefined' && 'BroadcastChannel' in window
+    ? new BroadcastChannel('lamavi_realtime_sync')
+    : null;
+
+export function notifyRealtimeSync(event: string, payload?: unknown) {
+  try {
+    lamaviBroadcast?.postMessage({ event, payload, timestamp: Date.now() });
+  } catch {
+    // ignore
+  }
+}
+
+export function subscribeRealtimeSync(
+  callback: (data: { event: string; payload?: unknown; timestamp: number }) => void
+): () => void {
+  if (!lamaviBroadcast) return () => {};
+  const handler = (e: MessageEvent) => {
+    if (e.data && typeof e.data.event === 'string') {
+      callback(e.data);
+    }
+  };
+  lamaviBroadcast.addEventListener('message', handler);
+  return () => lamaviBroadcast.removeEventListener('message', handler);
+}
+
 function generateClientRecoveryCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let p1 = '';
@@ -162,14 +195,64 @@ function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
     ...(b.sessions || {}),
   };
 
-  const convMap = new Map<string, StoredConversation>();
+  const convByPair = new Map<string, StoredConversation>();
+  const convIdRemap = new Map<string, string>();
   for (const c of [...(a.conversations || []), ...(b.conversations || [])]) {
-    convMap.set(c.id, c);
+    if (!c || !Array.isArray(c.participantIds) || c.participantIds.length < 2) continue;
+    const pairKey = [c.participantIds[0], c.participantIds[1]].sort().join(':');
+    const existingConv = convByPair.get(pairKey);
+    if (!existingConv) {
+      convByPair.set(pairKey, {
+        ...c,
+        deletedBy: Array.isArray(c.deletedBy) ? c.deletedBy : [],
+        clearedAt: c.clearedAt || {},
+      });
+      convIdRemap.set(c.id, c.id);
+    } else {
+      convIdRemap.set(c.id, existingConv.id);
+      const mergedUpdatedAt =
+        (c.updatedAt || '') > (existingConv.updatedAt || '')
+          ? c.updatedAt
+          : existingConv.updatedAt;
+      convByPair.set(pairKey, {
+        ...existingConv,
+        updatedAt: mergedUpdatedAt,
+        deletedBy:
+          (c.updatedAt || '') > (existingConv.updatedAt || '')
+            ? c.deletedBy || []
+            : existingConv.deletedBy || [],
+        clearedAt: { ...(existingConv.clearedAt || {}), ...(c.clearedAt || {}) },
+      });
+    }
   }
 
   const msgMap = new Map<string, StoredMessage>();
+  const statusRank: Record<string, number> = { sent: 1, delivered: 2, read: 3 };
   for (const m of [...(a.messages || []), ...(b.messages || [])]) {
-    msgMap.set(m.id, m);
+    if (!m || !m.id) continue;
+    const canonicalConvId = convIdRemap.get(m.conversationId) || m.conversationId;
+    const normalized: StoredMessage = {
+      ...m,
+      conversationId: canonicalConvId,
+      deletedFor: Array.isArray(m.deletedFor) ? m.deletedFor : [],
+      deletedForEveryone: Boolean(m.deletedForEveryone),
+    };
+    const prev = msgMap.get(m.id);
+    if (!prev) {
+      msgMap.set(m.id, normalized);
+    } else {
+      const bestStatus =
+        (statusRank[normalized.status] || 1) >= (statusRank[prev.status] || 1)
+          ? normalized.status
+          : prev.status;
+      msgMap.set(m.id, {
+        ...prev,
+        ...normalized,
+        status: bestStatus,
+        deliveredAt: normalized.deliveredAt || prev.deliveredAt,
+        readAt: normalized.readAt || prev.readAt,
+      });
+    }
   }
 
   const mediaMap = new Map<string, StoredMedia>();
@@ -205,7 +288,7 @@ function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
   return {
     users: Array.from(userMap.values()),
     sessions,
-    conversations: Array.from(convMap.values()),
+    conversations: Array.from(convByPair.values()),
     messages: Array.from(msgMap.values()),
     media: Array.from(mediaMap.values()),
     statuses: Array.from(statusMap.values()),
@@ -321,9 +404,9 @@ async function readCloudState(force = false): Promise<CloudState> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes('resource-exhausted') || errMsg.includes('Quota exceeded') || errMsg.includes('429')) {
-        clientQuotaBackoffUntilMs = Date.now() + 5 * 60 * 1000;
+        clientQuotaBackoffUntilMs = Date.now() + 60 * 1000;
         lastClientQuotaErrorMsg =
-          'Firebase Firestore free daily quota (429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Newly created accounts on other devices cannot be fetched until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
+          'Firebase Firestore free daily quota (429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Cross-device messages and new accounts cannot sync until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
       }
     }
   }
@@ -340,14 +423,21 @@ async function readCloudState(force = false): Promise<CloudState> {
   return resolved;
 }
 
-async function writeCloudState(state: CloudState, syncMedia = false): Promise<void> {
+async function writeCloudState(
+  state: CloudState,
+  syncMedia = false,
+  skipFirestore = false
+): Promise<{ ok: boolean; error?: string }> {
   try {
     localStorage.setItem(LOCAL_CLOUD_KEY, JSON.stringify(state));
   } catch {
     // ignore
   }
-  if (Date.now() < clientQuotaBackoffUntilMs) {
-    return;
+  if (skipFirestore) {
+    return { ok: true };
+  }
+  if (Date.now() < clientQuotaBackoffUntilMs && lastClientQuotaErrorMsg) {
+    return { ok: false, error: lastClientQuotaErrorMsg };
   }
   try {
     const coreState: CloudState = {
@@ -379,11 +469,17 @@ async function writeCloudState(state: CloudState, syncMedia = false): Promise<vo
         updatedAt: new Date().toISOString(),
       });
     }
+    lastClientQuotaErrorMsg = null;
+    return { ok: true };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     if (errMsg.includes('resource-exhausted') || errMsg.includes('Quota exceeded') || errMsg.includes('429')) {
-      clientQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000;
+      clientQuotaBackoffUntilMs = Date.now() + 60 * 1000;
+      lastClientQuotaErrorMsg =
+        'Firebase Firestore free daily quota (429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89.';
+      return { ok: false, error: lastClientQuotaErrorMsg };
     }
+    return { ok: false, error: errMsg };
   }
 }
 
@@ -435,7 +531,6 @@ function toUserProfile(u: StoredUser, viewerId: string, state: CloudState): User
 
 // Intercept `/api/*` calls automatically when running on a static host where the backend returns 404/HTML or throws a network error
 export function installServerlessFallbackInterceptor() {
-
   const originalFetch = window.fetch.bind(window);
 
   const wrappedFetch: typeof window.fetch = async (input, init) => {
@@ -474,7 +569,7 @@ export function installServerlessFallbackInterceptor() {
       const response = await originalFetch(input, nextInit);
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
-        // When register or login succeeds on backend, mirror the user, passwordDigest & token into client cloud state too so any device can log in or search them!
+        // When register or login succeeds on backend, mirror the user & token into local fallback cache ONLY (skipFirestore = true because backend already persisted to Firestore)
         if (
           response.ok &&
           (urlStr.startsWith('/api/auth/register') ||
@@ -486,7 +581,7 @@ export function installServerlessFallbackInterceptor() {
             .json()
             .then(async (data) => {
               if (data && data.user) {
-                const st = await readCloudState();
+                const st = await readCloudState(false);
                 const existingIdx = st.users.findIndex(
                   (u) =>
                     u.id === data.user.id ||
@@ -550,8 +645,62 @@ export function installServerlessFallbackInterceptor() {
                 if (data.token) {
                   st.sessions[data.token] = data.user.id;
                 }
-                await writeCloudState(st);
+                await writeCloudState(st, false, true);
               }
+            })
+            .catch(() => {});
+        }
+
+        // Also mirror sent messages and started conversations into local fallback cache so multi-tab BroadcastChannel sync works immediately
+        if (
+          response.ok &&
+          init?.method === 'POST' &&
+          (urlStr.startsWith('/api/conversations/start') ||
+            /^\/api\/conversations\/[^/]+\/messages$/.test(urlStr))
+        ) {
+          response
+            .clone()
+            .json()
+            .then(async (data) => {
+              const st = await readCloudState(false);
+              if (data.conversation && data.conversation.id && data.conversation.recipient) {
+                const cachedUserRaw = localStorage.getItem('lamavi_current_user');
+                const me = cachedUserRaw ? JSON.parse(cachedUserRaw) : null;
+                if (me && me.id) {
+                  const exists = st.conversations.some((c) => c.id === data.conversation.id);
+                  if (!exists) {
+                    st.conversations.push({
+                      id: data.conversation.id,
+                      participantIds: [me.id, data.conversation.recipient.id],
+                      createdAt: data.conversation.createdAt || new Date().toISOString(),
+                      updatedAt: data.conversation.updatedAt || new Date().toISOString(),
+                      deletedBy: [],
+                      clearedAt: {},
+                    });
+                  }
+                }
+              }
+              if (data.message && data.message.id) {
+                if (!st.messages.some((m) => m.id === data.message.id)) {
+                  st.messages.push({
+                    ...data.message,
+                    expiresAt:
+                      data.message.expiresAt ||
+                      new Date(Date.now() + SEVEN_DAYS_MS).toISOString(),
+                    deletedFor: [],
+                    deletedForEveryone: false,
+                  });
+                }
+                const c = st.conversations.find((cv) => cv.id === data.message.conversationId);
+                if (c) {
+                  c.updatedAt = data.message.createdAt;
+                  c.deletedBy = [];
+                }
+              }
+              await writeCloudState(st, false, true);
+              notifyRealtimeSync('message:sync', {
+                conversationId: data.message?.conversationId || data.conversation?.id,
+              });
             })
             .catch(() => {});
         }
@@ -1160,9 +1309,10 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     );
     const now = new Date().toISOString();
     if (!conv) {
+      const sortedPair = [currentUser.id, recipientId].sort() as [string, string];
       conv = {
-        id: `conv_${randomHex(8)}`,
-        participantIds: [currentUser.id, recipientId],
+        id: await getDeterministicClientConvId(currentUser.id, recipientId),
+        participantIds: sortedPair,
         createdAt: now,
         updatedAt: now,
         deletedBy: [],
@@ -1173,6 +1323,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       conv.deletedBy = conv.deletedBy.filter((id) => id !== currentUser.id);
     }
     await writeCloudState(state);
+    notifyRealtimeSync('message:sync', { conversationId: conv.id });
     return jsonResponse(200, {
       conversation: {
         id: conv.id,
@@ -1190,14 +1341,39 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   const msgMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
   if (msgMatch) {
     const convId = msgMatch[1];
-    const conv = state.conversations.find((c) => c.id === convId);
+    let conv = state.conversations.find((c) => c.id === convId);
+    const recipientIdParam =
+      url.searchParams.get('recipientId') ||
+      (typeof bodyObj.recipientId === 'string' ? bodyObj.recipientId : '');
+    if (!conv && recipientIdParam) {
+      conv = state.conversations.find(
+        (c) =>
+          c.participantIds.includes(currentUser.id) &&
+          c.participantIds.includes(recipientIdParam)
+      );
+      if (!conv && method === 'POST') {
+        const nowStr = new Date().toISOString();
+        const sortedPair = [currentUser.id, recipientIdParam].sort() as [string, string];
+        conv = {
+          id: convId.startsWith('conv_')
+            ? convId
+            : await getDeterministicClientConvId(currentUser.id, recipientIdParam),
+          participantIds: sortedPair,
+          createdAt: nowStr,
+          updatedAt: nowStr,
+          deletedBy: [],
+          clearedAt: {},
+        };
+        state.conversations.push(conv);
+      }
+    }
     if (!conv) return jsonResponse(404, { error: 'Conversation not found.' });
     if (method === 'GET') {
       const clearedAfter = conv.clearedAt[currentUser.id] || '';
       const messages = state.messages
         .filter(
           (m) =>
-            m.conversationId === convId &&
+            m.conversationId === conv!.id &&
             !m.deletedFor.includes(currentUser.id) &&
             (!clearedAfter || m.createdAt > clearedAfter)
         )
@@ -1212,7 +1388,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
               }
             : m
         );
-      return jsonResponse(200, { messages });
+      return jsonResponse(200, { messages, conversationId: conv.id });
     }
     if (method === 'POST') {
       const { text, imageId, replyToMessageId, clientTempId } = bodyObj;
@@ -1220,7 +1396,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       const newMsg: StoredMessage = {
         id: `msg_${randomHex(8)}`,
         clientTempId,
-        conversationId: convId,
+        conversationId: conv.id,
         senderId: currentUser.id,
         text: String(text || '').trim(),
         imageId,
@@ -1235,7 +1411,15 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       conv.updatedAt = now.toISOString();
       conv.deletedBy = [];
       state.messages.push(newMsg);
-      await writeCloudState(state);
+      const writeRes = await writeCloudState(state);
+      notifyRealtimeSync('message:sync', { conversationId: conv.id });
+      if (!writeRes.ok) {
+        return jsonResponse(503, {
+          error:
+            writeRes.error ||
+            'Failed to persist message to Firebase Firestore across devices.',
+        });
+      }
       return jsonResponse(201, { message: newMsg });
     }
   }
