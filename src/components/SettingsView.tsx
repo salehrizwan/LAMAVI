@@ -343,10 +343,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           </div>
 
-          {/* PWA Install Row if available */}
-          <div className="rounded-2xl overflow-hidden border border-[#E5E5EA]">
-            <PWAInstallButton variant="row" />
-          </div>
+          {/* PWA Install Row when opened in browser */}
+          <PWAInstallButton variant="row" />
 
           {/* Categorized WhatsApp-iOS Style Rows */}
           <div className="bg-white rounded-3xl border border-[#E5E5EA] divide-y divide-[#E5E5EA] overflow-hidden shadow-2xs">

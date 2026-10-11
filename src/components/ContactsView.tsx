@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { UserProfile } from '../types';
 import { Avatar } from './Avatar';
+import { FullScreenImageViewer } from './SecureImage';
 
 interface ContactsViewProps {
   currentUser: UserProfile;
@@ -37,6 +38,7 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
   const [reportReason, setReportReason] = useState('Spam or unsolicited messages');
   const [reportDetails, setReportDetails] = useState('');
   const [reportSubmitted, setReportSubmitted] = useState<string | null>(null);
+  const [fullScreenDp, setFullScreenDp] = useState<{ src: string; caption?: string } | null>(null);
 
   const filteredContacts = contacts.filter(
     (c) =>
@@ -174,6 +176,15 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
                     size="md"
                     isOnline={contact.isOnline}
                     showPresence
+                    onClick={
+                      contact.avatarUrl
+                        ? () =>
+                            setFullScreenDp({
+                              src: contact.avatarUrl!,
+                              caption: `${contact.fullName} (@${contact.username})`,
+                            })
+                        : undefined
+                    }
                   />
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5">
@@ -313,6 +324,14 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {fullScreenDp && (
+        <FullScreenImageViewer
+          src={fullScreenDp.src}
+          caption={fullScreenDp.caption}
+          onClose={() => setFullScreenDp(null)}
+        />
       )}
     </div>
   );

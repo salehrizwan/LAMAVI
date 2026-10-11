@@ -29,6 +29,7 @@ import { ContactsView } from './components/ContactsView';
 import { SettingsView } from './components/SettingsView';
 import { UserSearchModal } from './components/UserSearchModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { FullScreenImageViewer } from './components/SecureImage';
 import { formatRelativeTime } from './utils/media';
 import './firebase';
 
@@ -53,11 +54,15 @@ export default function App() {
     }
   });
 
-  const [authChecking, setAuthChecking] = useState<boolean>(!!token);
+  const [authChecking, setAuthChecking] = useState<boolean>(() => !!token && !currentUser);
   const [activeTab, setActiveTab] = useState<ActiveTab>('chats');
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
   const [chatListSearch, setChatListSearch] = useState('');
   const [showUserSearchModal, setShowUserSearchModal] = useState(false);
+  const [fullScreenDpPreview, setFullScreenDpPreview] = useState<{
+    src: string;
+    caption?: string;
+  } | null>(null);
 
   // Real-time and cached state
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
@@ -134,17 +139,6 @@ export default function App() {
             setCurrentUser(data.user);
             localStorage.setItem('lamavi_current_user', JSON.stringify(data.user));
           }
-          return;
-        }
-        // Only clear session if there is no cached user profile on this device
-        const cachedRaw = localStorage.getItem('lamavi_current_user');
-        if (res.status === 401 && !cachedRaw) {
-          localStorage.removeItem('lamavi_auth_token');
-          localStorage.removeItem('lamavi_current_user');
-          localStorage.removeItem('nacre_auth_token');
-          localStorage.removeItem('nacre_current_user');
-          setToken(null);
-          setCurrentUser(null);
         }
       })
       .catch(() => {})
@@ -864,21 +858,33 @@ export default function App() {
                     const showPreview = currentUser.notifications?.previewText ?? true;
 
                     return (
-                      <button
+                      <div
                         key={conv.id}
-                        type="button"
                         onClick={() => setSelectedConvId(conv.id)}
-                        className={`w-full px-4 py-3.5 flex items-center gap-3.5 text-left transition-colors ${
+                        className={`w-full px-4 py-3.5 flex items-center gap-3.5 text-left transition-colors cursor-pointer ${
                           isSelected ? 'bg-[#F2F2F7]' : 'hover:bg-[#F8F9FA]'
                         }`}
                       >
-                        <Avatar
-                          src={conv.recipient.avatarUrl}
-                          name={conv.recipient.fullName}
-                          size="lg"
-                          isOnline={conv.recipient.isOnline}
-                          showPresence
-                        />
+                        <div
+                          onClick={(e) => {
+                            if (conv.recipient.avatarUrl) {
+                              e.stopPropagation();
+                              setFullScreenDpPreview({
+                                src: conv.recipient.avatarUrl,
+                                caption: `${conv.recipient.fullName} (@${conv.recipient.username})`,
+                              });
+                            }
+                          }}
+                          title={conv.recipient.avatarUrl ? 'Tap to view DP' : undefined}
+                        >
+                          <Avatar
+                            src={conv.recipient.avatarUrl}
+                            name={conv.recipient.fullName}
+                            size="lg"
+                            isOnline={conv.recipient.isOnline}
+                            showPresence
+                          />
+                        </div>
 
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center justify-between gap-2">
@@ -937,7 +943,7 @@ export default function App() {
                             )}
                           </div>
                         </div>
-                      </button>
+                      </div>
                     );
                   })
                 )}
@@ -1138,6 +1144,15 @@ export default function App() {
           onClose={() => setShowUserSearchModal(false)}
           onStartConversation={handleStartConversation}
           onAddContact={handleAddContact}
+        />
+      )}
+
+      {/* Full Screen DP Preview from Chat List */}
+      {fullScreenDpPreview && (
+        <FullScreenImageViewer
+          src={fullScreenDpPreview.src}
+          caption={fullScreenDpPreview.caption}
+          onClose={() => setFullScreenDpPreview(null)}
         />
       )}
     </div>

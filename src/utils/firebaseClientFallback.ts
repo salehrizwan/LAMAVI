@@ -388,13 +388,96 @@ export function installServerlessFallbackInterceptor() {
       return originalFetch(input, init);
     }
 
+    // Attach current user profile header so cold serverless instances can recover session seamlessly
+    const mergedHeaders = new Headers(init?.headers || {});
     try {
-      const response = await originalFetch(input, init);
+      const cachedUserRaw = localStorage.getItem('lamavi_current_user');
+      if (cachedUserRaw && !mergedHeaders.has('X-Lamavi-User')) {
+        mergedHeaders.set('X-Lamavi-User', cachedUserRaw);
+      }
+    } catch {
+      // ignore
+    }
+    const nextInit: RequestInit = {
+      ...init,
+      headers: mergedHeaders,
+    };
+
+    try {
+      const response = await originalFetch(input, nextInit);
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
+        // When register or login succeeds on backend, mirror the user & token into client cloud state too so client fallback always recognizes the session
+        if (
+          response.ok &&
+          (urlStr.startsWith('/api/auth/register') ||
+            urlStr.startsWith('/api/auth/login') ||
+            urlStr.startsWith('/api/users/profile'))
+        ) {
+          response
+            .clone()
+            .json()
+            .then(async (data) => {
+              if (data && data.user) {
+                const st = await readCloudState();
+                const existingIdx = st.users.findIndex(
+                  (u) =>
+                    u.id === data.user.id ||
+                    u.username.toLowerCase() === String(data.user.username || '').toLowerCase()
+                );
+                const now = new Date().toISOString();
+                const uObj: StoredUser = {
+                  id: data.user.id,
+                  fullName: data.user.fullName || '',
+                  username: String(data.user.username || '').toLowerCase(),
+                  email: String(data.user.email || '').toLowerCase(),
+                  passwordDigest: existingIdx >= 0 ? st.users[existingIdx].passwordDigest : '',
+                  recoveryDigest: existingIdx >= 0 ? st.users[existingIdx].recoveryDigest : '',
+                  bio: data.user.bio || '',
+                  avatarUrl: data.user.avatarUrl || '',
+                  createdAt: data.user.createdAt || now,
+                  lastSeen: now,
+                  isOnline: true,
+                  usernameChangeTimestamps: [],
+                  privacy: data.user.privacy || {
+                    profilePicVisibility: 'everyone',
+                    lastSeenVisibility: 'everyone',
+                    readReceipts: true,
+                    statusPrivacy: 'everyone',
+                    whoCanContact: 'everyone',
+                  },
+                  notifications: data.user.notifications || {
+                    messageAlerts: true,
+                    soundEnabled: true,
+                    previewText: true,
+                  },
+                  chatSettings: data.user.chatSettings || {
+                    enterToSend: true,
+                    fontSize: 'medium',
+                    autoDownloadImages: true,
+                  },
+                };
+                if (existingIdx >= 0) {
+                  st.users[existingIdx] = { ...st.users[existingIdx], ...uObj };
+                } else {
+                  st.users.push(uObj);
+                }
+                if (data.token) {
+                  st.sessions[data.token] = data.user.id;
+                }
+                await writeCloudState(st);
+              }
+            })
+            .catch(() => {});
+        }
+
         // If backend returned 401 on a cold serverless instance, verify against Firebase cloud fallback before failing
-        if (response.status === 401 && !urlStr.startsWith('/api/auth/login') && !urlStr.startsWith('/api/auth/recover')) {
-          const fallbackRes = await handleFallbackApiRequest(urlStr, init);
+        if (
+          response.status === 401 &&
+          !urlStr.startsWith('/api/auth/login') &&
+          !urlStr.startsWith('/api/auth/recover')
+        ) {
+          const fallbackRes = await handleFallbackApiRequest(urlStr, nextInit);
           if (fallbackRes.ok) {
             return fallbackRes;
           }
@@ -406,8 +489,7 @@ export function installServerlessFallbackInterceptor() {
           if (data && data.result) {
             return response;
           }
-          // Try client cloud fallback if server returned null
-          const fallbackRes = await handleFallbackApiRequest(urlStr, init);
+          const fallbackRes = await handleFallbackApiRequest(urlStr, nextInit);
           const fallbackData = await fallbackRes.clone().json();
           if (fallbackData && fallbackData.result) {
             return fallbackRes;
@@ -419,7 +501,7 @@ export function installServerlessFallbackInterceptor() {
       // Network error reaching `/api/*` -> fall through to Firebase Cloud handler
     }
 
-    return handleFallbackApiRequest(urlStr, init);
+    return handleFallbackApiRequest(urlStr, nextInit);
   };
 
   try {
@@ -462,8 +544,48 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
         const cachedUser = JSON.parse(cachedRaw) as UserProfile;
         if (cachedUser && cachedUser.id) {
           currentUser = state.users.find(
-            (u) => u.id === cachedUser.id || u.username.toLowerCase() === cachedUser.username.toLowerCase()
+            (u) =>
+              u.id === cachedUser.id ||
+              u.username.toLowerCase() === cachedUser.username.toLowerCase()
           );
+          if (!currentUser) {
+            const now = new Date().toISOString();
+            const recovered: StoredUser = {
+              id: cachedUser.id,
+              fullName: cachedUser.fullName || cachedUser.username,
+              username: cachedUser.username.toLowerCase(),
+              email: (cachedUser.email || '').toLowerCase(),
+              passwordDigest: '',
+              recoveryDigest: '',
+              bio: cachedUser.bio || '',
+              avatarUrl: cachedUser.avatarUrl || '',
+              createdAt: cachedUser.createdAt || now,
+              lastSeen: now,
+              isOnline: true,
+              usernameChangeTimestamps: [],
+              privacy: cachedUser.privacy || {
+                profilePicVisibility: 'everyone',
+                lastSeenVisibility: 'everyone',
+                readReceipts: true,
+                statusPrivacy: 'everyone',
+                whoCanContact: 'everyone',
+              },
+              notifications: cachedUser.notifications || {
+                messageAlerts: true,
+                soundEnabled: true,
+                previewText: true,
+              },
+              chatSettings: cachedUser.chatSettings || {
+                enterToSend: true,
+                fontSize: 'medium',
+                autoDownloadImages: true,
+              },
+            };
+            state.users.push(recovered);
+            state.sessions[token] = recovered.id;
+            await writeCloudState(state);
+            currentUser = recovered;
+          }
         }
       }
     } catch {
@@ -644,6 +766,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       currentUser.notifications = { ...currentUser.notifications, ...notifications };
     if (chatSettings) currentUser.chatSettings = { ...currentUser.chatSettings, ...chatSettings };
 
+    currentUser.lastSeen = new Date().toISOString();
     await writeCloudState(state);
     return jsonResponse(200, { user: toUserProfile(currentUser, currentUser.id, state) });
   }
@@ -712,6 +835,29 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     return jsonResponse(200, { contact: toUserProfile(target, currentUser.id, state) });
   }
 
+  if (pathname === '/api/users/block' && method === 'POST') {
+    const { targetUserId } = bodyObj;
+    if (
+      targetUserId &&
+      !state.blocks.some(
+        (b) => b.blockerId === currentUser.id && b.blockedUserId === targetUserId
+      )
+    ) {
+      state.blocks.push({ blockerId: currentUser.id, blockedUserId: targetUserId });
+      await writeCloudState(state);
+    }
+    return jsonResponse(200, { success: true });
+  }
+
+  if (pathname === '/api/users/unblock' && method === 'POST') {
+    const { targetUserId } = bodyObj;
+    state.blocks = state.blocks.filter(
+      (b) => !(b.blockerId === currentUser.id && b.blockedUserId === targetUserId)
+    );
+    await writeCloudState(state);
+    return jsonResponse(200, { success: true });
+  }
+
   // Conversations
   if (pathname === '/api/conversations' && method === 'GET') {
     const list: ConversationItem[] = state.conversations
@@ -732,9 +878,17 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
               (!clearedAfter || m.createdAt > clearedAfter)
           )
           .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-        const lastMsg = msgs.length > 0 ? (msgs[msgs.length - 1] as unknown as MessageItem) : null;
+        const lastMsgRaw = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+        const lastMsg = lastMsgRaw
+          ? ({
+              ...lastMsgRaw,
+              text: lastMsgRaw.deletedForEveryone ? 'This message was deleted' : lastMsgRaw.text,
+              imageId: lastMsgRaw.deletedForEveryone ? undefined : lastMsgRaw.imageId,
+              isDeletedPlaceholder: lastMsgRaw.deletedForEveryone,
+            } as unknown as MessageItem)
+          : null;
         const unreadCount = msgs.filter(
-          (m) => m.senderId !== currentUser.id && m.status !== 'read'
+          (m) => m.senderId !== currentUser.id && m.status !== 'read' && !m.deletedForEveryone
         ).length;
         return {
           id: c.id,
@@ -823,7 +977,17 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
             !m.deletedFor.includes(currentUser.id) &&
             (!clearedAfter || m.createdAt > clearedAfter)
         )
-        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+        .map((m) =>
+          m.deletedForEveryone
+            ? {
+                ...m,
+                text: 'This message was deleted',
+                imageId: undefined,
+                isDeletedPlaceholder: true,
+              }
+            : m
+        );
       return jsonResponse(200, { messages });
     }
     if (method === 'POST') {
@@ -845,6 +1009,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
         deletedForEveryone: false,
       };
       conv.updatedAt = now.toISOString();
+      conv.deletedBy = [];
       state.messages.push(newMsg);
       await writeCloudState(state);
       return jsonResponse(201, { message: newMsg });
@@ -867,9 +1032,62 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     return jsonResponse(200, { updatedCount: count });
   }
 
+  const clearMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/clear$/);
+  if (clearMatch && method === 'POST') {
+    const conv = state.conversations.find((c) => c.id === clearMatch[1]);
+    if (conv) {
+      conv.clearedAt[currentUser.id] = new Date().toISOString();
+      await writeCloudState(state);
+    }
+    return jsonResponse(200, { success: true });
+  }
+
+  const delConvMatch = pathname.match(/^\/api\/conversations\/([^/]+)$/);
+  if (delConvMatch && method === 'DELETE') {
+    const conv = state.conversations.find((c) => c.id === delConvMatch[1]);
+    if (conv) {
+      conv.clearedAt[currentUser.id] = new Date().toISOString();
+      if (!conv.deletedBy.includes(currentUser.id)) {
+        conv.deletedBy.push(currentUser.id);
+      }
+      await writeCloudState(state);
+    }
+    return jsonResponse(200, { success: true });
+  }
+
+  const delMsgMatch = pathname.match(/^\/api\/messages\/([^/]+)$/);
+  if (delMsgMatch && method === 'DELETE') {
+    const msgId = delMsgMatch[1];
+    const mode = url.searchParams.get('mode') === 'everyone' ? 'everyone' : 'me';
+    const msg = state.messages.find((m) => m.id === msgId);
+    if (msg) {
+      if (mode === 'everyone' && msg.senderId === currentUser.id) {
+        msg.deletedForEveryone = true;
+        msg.text = '';
+        msg.imageId = undefined;
+      } else if (!msg.deletedFor.includes(currentUser.id)) {
+        msg.deletedFor.push(currentUser.id);
+      }
+      await writeCloudState(state);
+    }
+    return jsonResponse(200, { success: true });
+  }
+
   if (pathname === '/api/statuses' && method === 'GET') {
     const statuses: StatusItem[] = state.statuses
-      .filter((s) => s.userId === currentUser.id || state.contacts.some((c) => c.userId === currentUser.id && c.contactUserId === s.userId))
+      .filter(
+        (s) =>
+          s.userId === currentUser.id ||
+          state.contacts.some(
+            (c) =>
+              (c.userId === currentUser.id && c.contactUserId === s.userId) ||
+              (c.userId === s.userId && c.contactUserId === currentUser.id)
+          ) ||
+          state.conversations.some(
+            (cv) =>
+              cv.participantIds.includes(currentUser.id) && cv.participantIds.includes(s.userId)
+          )
+      )
       .map((s) => {
         const owner = state.users.find((u) => u.id === s.userId);
         return {
@@ -911,6 +1129,27 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     state.statuses.push(st);
     await writeCloudState(state);
     return jsonResponse(201, { status: st });
+  }
+
+  const viewStatusMatch = pathname.match(/^\/api\/statuses\/([^/]+)\/view$/);
+  if (viewStatusMatch && method === 'POST') {
+    const st = state.statuses.find((s) => s.id === viewStatusMatch[1]);
+    if (st && st.userId !== currentUser.id) {
+      if (!st.viewers.some((v) => v.viewerId === currentUser.id)) {
+        st.viewers.push({ viewerId: currentUser.id, viewedAt: new Date().toISOString() });
+        await writeCloudState(state);
+      }
+    }
+    return jsonResponse(200, { success: true });
+  }
+
+  const delStatusMatch = pathname.match(/^\/api\/statuses\/([^/]+)$/);
+  if (delStatusMatch && method === 'DELETE') {
+    state.statuses = state.statuses.filter(
+      (s) => !(s.id === delStatusMatch[1] && s.userId === currentUser.id)
+    );
+    await writeCloudState(state);
+    return jsonResponse(200, { success: true });
   }
 
   if (pathname === '/api/media' && method === 'POST') {

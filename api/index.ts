@@ -673,6 +673,71 @@ export function createApiApp(
       await ensureCloudDatabaseLoaded(true);
       user = resolveUserFromToken(token);
     }
+
+    // If still not found, check if client passed their authenticated user profile header so cold serverless instances can recover seamlessly
+    if (!user) {
+      const fallbackUserHeader = req.headers['x-lamavi-user'];
+      if (typeof fallbackUserHeader === 'string' && fallbackUserHeader.trim()) {
+        try {
+          const parsedUser = JSON.parse(fallbackUserHeader) as Partial<UserRecord>;
+          if (parsedUser && parsedUser.id && parsedUser.username) {
+            user = db.users.find(
+              (u) =>
+                u.id === parsedUser.id ||
+                u.username.toLowerCase() === String(parsedUser.username).toLowerCase()
+            ) || null;
+            if (!user) {
+              const now = new Date().toISOString();
+              const recoveredUser: UserRecord = {
+                id: parsedUser.id,
+                fullName: parsedUser.fullName || parsedUser.username,
+                username: String(parsedUser.username).toLowerCase(),
+                email: String(parsedUser.email || '').toLowerCase(),
+                passwordSalt: 'sha256_client',
+                passwordHash: '',
+                recoveryCodeSalt: 'sha256_client',
+                recoveryCodeHash: '',
+                bio: parsedUser.bio || '',
+                avatarUrl: parsedUser.avatarUrl || '',
+                createdAt: parsedUser.createdAt || now,
+                lastSeen: now,
+                isOnline: true,
+                usernameChangeTimestamps: [],
+                privacy: parsedUser.privacy || {
+                  profilePicVisibility: 'everyone',
+                  lastSeenVisibility: 'everyone',
+                  readReceipts: true,
+                  statusPrivacy: 'everyone',
+                  whoCanContact: 'everyone',
+                },
+                notifications: parsedUser.notifications || {
+                  messageAlerts: true,
+                  soundEnabled: true,
+                  previewText: true,
+                },
+                chatSettings: parsedUser.chatSettings || {
+                  enterToSend: true,
+                  fontSize: 'medium',
+                  autoDownloadImages: true,
+                },
+              };
+              db.users.push(recoveredUser);
+              db.sessions.push({
+                token,
+                userId: recoveredUser.id,
+                createdAt: now,
+                expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+              });
+              await saveDatabase();
+              user = recoveredUser;
+            }
+          }
+        } catch {
+          // ignore invalid header
+        }
+      }
+    }
+
     return user;
   }
 
@@ -866,7 +931,8 @@ export function createApiApp(
     });
   });
 
-  app.post('/api/auth/recover', (req, res) => {
+  app.post('/api/auth/recover', async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const { identifier, recoveryCode, newPassword } = req.body || {};
     if (!identifier || !recoveryCode || !newPassword) {
       res.status(400).json({
@@ -906,20 +972,20 @@ export function createApiApp(
     const { salt, hash } = hashSecret(newPassword);
     user.passwordSalt = salt;
     user.passwordHash = hash;
-    saveDatabase();
+    await saveDatabase();
 
     res.json({
       message: 'Password updated successfully. You can now log in.',
     });
   });
 
-  app.post('/api/auth/logout', requireAuth, (req, res) => {
+  app.post('/api/auth/logout', requireAuth, async (req, res) => {
     const authHeader = req.headers.authorization;
     const token = authHeader?.startsWith('Bearer ')
       ? authHeader.slice(7).trim()
       : '';
     db.sessions = db.sessions.filter((s) => s.token !== token);
-    saveDatabase();
+    await saveDatabase();
     res.json({ success: true });
   });
 
@@ -931,7 +997,7 @@ export function createApiApp(
   });
 
   // --- PROFILE & ACCOUNT SETTINGS ---
-  app.put('/api/users/profile', requireAuth, (req, res) => {
+  app.put('/api/users/profile', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const {
       fullName,
@@ -1044,7 +1110,8 @@ export function createApiApp(
       user.chatSettings = { ...user.chatSettings, ...chatSettings };
     }
 
-    saveDatabase();
+    user.lastSeen = new Date().toISOString();
+    await saveDatabase();
 
     for (const u of db.users) {
       sendToUser(u.id, 'user:updated', sanitizeUserForViewer(user, u.id));
@@ -1053,7 +1120,7 @@ export function createApiApp(
     res.json({ user: sanitizeUserForViewer(user, user.id) });
   });
 
-  app.post('/api/users/change-password', requireAuth, (req, res) => {
+  app.post('/api/users/change-password', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const { currentPassword, newPassword } = req.body || {};
 
@@ -1074,11 +1141,11 @@ export function createApiApp(
     const { salt, hash } = hashSecret(newPassword);
     user.passwordSalt = salt;
     user.passwordHash = hash;
-    saveDatabase();
+    await saveDatabase();
     res.json({ message: 'Password updated successfully.' });
   });
 
-  app.delete('/api/users/account', requireAuth, (req, res) => {
+  app.delete('/api/users/account', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const uid = user.id;
 
@@ -1100,7 +1167,7 @@ export function createApiApp(
     db.conversations = db.conversations.filter((c) => !convIds.has(c.id));
     db.messages = db.messages.filter((m) => !convIds.has(m.conversationId));
 
-    saveDatabase();
+    await saveDatabase();
     res.json({ success: true });
   });
 
@@ -1209,7 +1276,7 @@ export function createApiApp(
     res.json({ contacts, blockedUsers });
   });
 
-  app.post('/api/contacts/add', requireAuth, (req, res) => {
+  app.post('/api/contacts/add', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId } = req.body || {};
 
@@ -1234,13 +1301,13 @@ export function createApiApp(
         contactUserId: target.id,
         createdAt: new Date().toISOString(),
       });
-      saveDatabase();
+      await saveDatabase();
     }
 
     res.json({ contact: sanitizeUserForViewer(target, user.id) });
   });
 
-  app.post('/api/users/block', requireAuth, (req, res) => {
+  app.post('/api/users/block', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId } = req.body || {};
     if (!targetUserId || targetUserId === user.id) {
@@ -1257,22 +1324,22 @@ export function createApiApp(
         blockedUserId: targetUserId,
         createdAt: new Date().toISOString(),
       });
-      saveDatabase();
+      await saveDatabase();
     }
     res.json({ success: true });
   });
 
-  app.post('/api/users/unblock', requireAuth, (req, res) => {
+  app.post('/api/users/unblock', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId } = req.body || {};
     db.blocks = db.blocks.filter(
       (b) => !(b.blockerId === user.id && b.blockedUserId === targetUserId)
     );
-    saveDatabase();
+    await saveDatabase();
     res.json({ success: true });
   });
 
-  app.post('/api/users/report', requireAuth, (req, res) => {
+  app.post('/api/users/report', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId, reason, details } = req.body || {};
     if (!targetUserId || !reason) {
@@ -1289,7 +1356,7 @@ export function createApiApp(
       details: String(details || ''),
       createdAt: new Date().toISOString(),
     });
-    saveDatabase();
+    await saveDatabase();
     res.json({
       message:
         'Report submitted. Our trust & safety team will review this account.',
@@ -1297,7 +1364,7 @@ export function createApiApp(
   });
 
   // --- SECURE MEDIA UPLOAD & ACCESS (7-DAY RETENTION) ---
-  app.post('/api/media', requireAuth, (req, res) => {
+  app.post('/api/media', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const { dataBase64, mimeType, conversationId, statusId } = req.body || {};
 
@@ -1354,7 +1421,7 @@ export function createApiApp(
     };
 
     db.media.push(media);
-    saveDatabase();
+    await saveDatabase();
 
     res.status(201).json({
       mediaId: media.id,
@@ -1491,7 +1558,7 @@ export function createApiApp(
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  app.get('/api/conversations', requireAuth, (req, res) => {
+  app.get('/api/conversations', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
 
     const now = new Date().toISOString();
@@ -1519,12 +1586,12 @@ export function createApiApp(
         });
       }
     }
-    if (anyDelivered) saveDatabase();
+    if (anyDelivered) await saveDatabase();
 
     res.json({ conversations: getConversationsForUser(user.id) });
   });
 
-  app.post('/api/conversations/start', requireAuth, (req, res) => {
+  app.post('/api/conversations/start', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const { recipientId } = req.body || {};
 
@@ -1598,7 +1665,7 @@ export function createApiApp(
       });
     }
 
-    saveDatabase();
+    await saveDatabase();
     const formattedList = getConversationsForUser(user.id);
     const formatted = formattedList.find((c) => c.id === conv!.id);
     res.json({ conversation: formatted });
@@ -1639,7 +1706,7 @@ export function createApiApp(
   app.post(
     '/api/conversations/:conversationId/messages',
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
       const user = (req as express.Request & { user: UserRecord }).user;
       const conv = db.conversations.find(
         (c) => c.id === req.params.conversationId
@@ -1716,7 +1783,7 @@ export function createApiApp(
       conv.updatedAt = nowIso;
       conv.deletedBy = [];
       db.messages.push(newMessage);
-      saveDatabase();
+      await saveDatabase();
 
       sendToUser(otherId, 'message:new', {
         conversationId: conv.id,
@@ -1738,7 +1805,7 @@ export function createApiApp(
   app.post(
     '/api/conversations/:conversationId/read',
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
       const user = (req as express.Request & { user: UserRecord }).user;
       const conv = db.conversations.find(
         (c) => c.id === req.params.conversationId
@@ -1774,7 +1841,7 @@ export function createApiApp(
       }
 
       if (updatedIds.length > 0) {
-        saveDatabase();
+        await saveDatabase();
         if (allowReadReceipts) {
           sendToUser(otherId, 'messages:read', {
             conversationId: conv.id,
@@ -1788,7 +1855,7 @@ export function createApiApp(
     }
   );
 
-  app.delete('/api/messages/:messageId', requireAuth, (req, res) => {
+  app.delete('/api/messages/:messageId', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const mode = req.query.mode === 'everyone' ? 'everyone' : 'me';
     const msg = db.messages.find((m) => m.id === req.params.messageId);
@@ -1814,7 +1881,7 @@ export function createApiApp(
       msg.deletedForEveryone = true;
       msg.text = '';
       msg.imageId = undefined;
-      saveDatabase();
+      await saveDatabase();
 
       for (const pid of conv.participantIds) {
         sendToUser(pid, 'message:deleted', {
@@ -1826,7 +1893,7 @@ export function createApiApp(
     } else {
       if (!msg.deletedFor.includes(user.id)) {
         msg.deletedFor.push(user.id);
-        saveDatabase();
+        await saveDatabase();
       }
       sendToUser(user.id, 'message:deleted', {
         conversationId: conv.id,
@@ -1841,7 +1908,7 @@ export function createApiApp(
   app.post(
     '/api/conversations/:conversationId/clear',
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
       const user = (req as express.Request & { user: UserRecord }).user;
       const conv = db.conversations.find(
         (c) => c.id === req.params.conversationId
@@ -1852,7 +1919,7 @@ export function createApiApp(
       }
 
       conv.clearedAt[user.id] = new Date().toISOString();
-      saveDatabase();
+      await saveDatabase();
       res.json({ success: true });
     }
   );
@@ -1860,7 +1927,7 @@ export function createApiApp(
   app.delete(
     '/api/conversations/:conversationId',
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
       const user = (req as express.Request & { user: UserRecord }).user;
       const conv = db.conversations.find(
         (c) => c.id === req.params.conversationId
@@ -1874,7 +1941,7 @@ export function createApiApp(
       if (!conv.deletedBy.includes(user.id)) {
         conv.deletedBy.push(user.id);
       }
-      saveDatabase();
+      await saveDatabase();
       res.json({ success: true });
     }
   );
@@ -1927,7 +1994,7 @@ export function createApiApp(
     res.json({ statuses: formatted });
   });
 
-  app.post('/api/statuses', requireAuth, (req, res) => {
+  app.post('/api/statuses', requireAuth, async (req, res) => {
     purgeExpiredRecords();
     const user = (req as express.Request & { user: UserRecord }).user;
     const { type, text, backgroundColor, textColor, imageId, privacy } =
@@ -1979,7 +2046,7 @@ export function createApiApp(
     }
 
     db.statuses.push(newStatus);
-    saveDatabase();
+    await saveDatabase();
 
     for (const u of db.users) {
       sendToUser(u.id, 'status:updated', { userId: user.id });
@@ -1988,7 +2055,7 @@ export function createApiApp(
     res.status(201).json({ status: newStatus });
   });
 
-  app.post('/api/statuses/:statusId/view', requireAuth, (req, res) => {
+  app.post('/api/statuses/:statusId/view', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const status = db.statuses.find((s) => s.id === req.params.statusId);
     if (!status) {
@@ -2008,7 +2075,7 @@ export function createApiApp(
           viewerId: user.id,
           viewedAt: now,
         });
-        saveDatabase();
+        await saveDatabase();
         sendToUser(status.userId, 'status:viewed', {
           statusId: status.id,
           viewer: sanitizeUserForViewer(user, status.userId),
@@ -2020,7 +2087,7 @@ export function createApiApp(
     res.json({ success: true });
   });
 
-  app.delete('/api/statuses/:statusId', requireAuth, (req, res) => {
+  app.delete('/api/statuses/:statusId', requireAuth, async (req, res) => {
     const user = (req as express.Request & { user: UserRecord }).user;
     const status = db.statuses.find((s) => s.id === req.params.statusId);
     if (!status || status.userId !== user.id) {
@@ -2032,7 +2099,7 @@ export function createApiApp(
 
     db.statuses = db.statuses.filter((s) => s.id !== status.id);
     db.statusViews = db.statusViews.filter((sv) => sv.statusId !== status.id);
-    saveDatabase();
+    await saveDatabase();
 
     for (const u of db.users) {
       sendToUser(u.id, 'status:updated', { userId: user.id });
