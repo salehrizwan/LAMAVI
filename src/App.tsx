@@ -31,7 +31,6 @@ import { UserSearchModal } from './components/UserSearchModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { FullScreenImageViewer } from './components/SecureImage';
 import { formatRelativeTime } from './utils/media';
-import './firebase';
 
 type ActiveTab = 'chats' | 'status' | 'contacts' | 'settings';
 const DEMO_USER_IDS = new Set(['usr_clara_vance', 'usr_julian_mercer', 'usr_sora_takahashi']);
@@ -194,13 +193,35 @@ export default function App() {
     async (convId: string) => {
       if (!token || !currentUser) return;
       try {
-        const res = await fetch(`/api/conversations/${convId}/messages`, {
+        const activeConvObj = conversations.find((c) => c.id === convId);
+        const recipientParam = activeConvObj?.recipient?.id
+          ? `?recipientId=${encodeURIComponent(activeConvObj.recipient.id)}`
+          : '';
+        const res = await fetch(`/api/conversations/${convId}/messages${recipientParam}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (res.ok) {
           const data = await res.json();
+          const canonicalId = data.conversationId || convId;
+          const serverMsgs: MessageItem[] = data.messages || [];
+          const serverIds = new Set(serverMsgs.map((m) => m.id));
+          const serverTempIds = new Set(
+            serverMsgs.map((m) => m.clientTempId).filter((id): id is string => !!id)
+          );
+
           setMessagesByConv((prev) => {
-            const next = { ...prev, [convId]: data.messages || [] };
+            const existingLocal = prev[canonicalId] || prev[convId] || [];
+            // Preserve unsent ('sending' or 'failed') local messages so polling never wipes out error diagnostics or in-flight messages
+            const unsentLocal = existingLocal.filter(
+              (m) =>
+                (m.status === 'sending' || m.status === 'failed' || m.status === 'pending') &&
+                !serverIds.has(m.id) &&
+                (!m.clientTempId || !serverTempIds.has(m.clientTempId))
+            );
+            const merged = [...serverMsgs, ...unsentLocal].sort((a, b) =>
+              a.createdAt.localeCompare(b.createdAt)
+            );
+            const next = { ...prev, [canonicalId]: merged, [convId]: merged };
             saveCache(currentUser.id, 'msgs', next);
             return next;
           });
@@ -218,7 +239,7 @@ export default function App() {
         // Offline fallback uses cached messagesByConv
       }
     },
-    [token, currentUser, saveCache]
+    [token, currentUser, conversations, saveCache]
   );
 
   useEffect(() => {
@@ -234,7 +255,7 @@ export default function App() {
     try {
       bc = new BroadcastChannel('lamavi_realtime_sync');
       bc.onmessage = (event) => {
-        if (event.data && event.data.type === 'state_updated') {
+        if (event.data && (event.data.type === 'state_updated' || event.data.event)) {
           fetchAllData();
           if (selectedConvId) {
             fetchConversationMessages(selectedConvId);
@@ -581,13 +602,25 @@ export default function App() {
             ? { ...m, status: 'failed' as const, errorMessage }
             : m
         );
-        return { ...prev, [conversationId]: list };
+        const next = { ...prev, [conversationId]: list };
+        saveCache(currentUser.id, 'msgs', next);
+        return next;
       });
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === conversationId && c.lastMessage?.clientTempId === clientTempId
+            ? {
+                ...c,
+                lastMessage: { ...c.lastMessage, status: 'failed' as const, errorMessage },
+              }
+            : c
+        )
+      );
     }
   };
 
   const handleStartConversation = async (targetUser: UserProfile) => {
-    if (!token || !isOnline) return;
+    if (!token || !isOnline || !currentUser) return;
     setShowUserSearchModal(false);
 
     try {
@@ -599,11 +632,12 @@ export default function App() {
         },
         body: JSON.stringify({ recipientId: targetUser.id, targetUser }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok && data.conversation) {
         await fetchAllData();
         setActiveTab('chats');
         setSelectedConvId(data.conversation.id);
+        return;
       }
     } catch {
       // Ignore if offline

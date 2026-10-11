@@ -2,7 +2,13 @@ import express from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import firebaseConfig from '../firebase-applet-config.json';
+import {
+  getActiveDbProvider,
+  getSupabaseAdapterStatus,
+  loadDatabaseFromSupabase,
+  saveDatabaseToSupabase,
+  deleteTableRowWhere,
+} from './db/supabaseAdapter';
 
 // --- TYPES & DATA MODEL ---
 export interface PrivacySettings {
@@ -263,9 +269,6 @@ function loadLocalDatabase(): DatabaseSchema {
 
 export let db: DatabaseSchema = loadLocalDatabase();
 
-const FIRESTORE_DOC_URL = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/lamavi_public/app_state?key=${firebaseConfig.apiKey}`;
-const FIRESTORE_MEDIA_URL = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/lamavi_public/app_media?key=${firebaseConfig.apiKey}`;
-
 function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>): DatabaseSchema {
   const userMap = new Map<string, UserRecord>();
   for (const u of base.users || []) {
@@ -353,33 +356,38 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
     }
   }
 
-  // Deduplicate conversations by participant pair so User A and User B always resolve to the exact same conversation record
+  // Deduplicate conversations by participant pair using deterministic conversation ID so User A and User B always resolve to the exact same conversation record
   const convByPair = new Map<string, ConversationRecord>();
   const convIdRemap = new Map<string, string>();
   for (const c of [...(base.conversations || []), ...(incoming.conversations || [])]) {
     if (!c || !Array.isArray(c.participantIds) || c.participantIds.length < 2) continue;
-    const pairKey = [c.participantIds[0], c.participantIds[1]].sort().join(':');
+    const sortedPair = [c.participantIds[0], c.participantIds[1]].sort() as [string, string];
+    const pairKey = sortedPair.join(':');
+    const canonicalId = getDeterministicConversationId(sortedPair[0], sortedPair[1]);
     const existingConv = convByPair.get(pairKey);
+    convIdRemap.set(c.id, canonicalId);
     if (!existingConv) {
       convByPair.set(pairKey, {
         ...c,
+        id: canonicalId,
+        participantIds: sortedPair,
         deletedBy: Array.isArray(c.deletedBy) ? c.deletedBy : [],
         clearedAt: c.clearedAt || {},
       });
-      convIdRemap.set(c.id, c.id);
     } else {
-      convIdRemap.set(c.id, existingConv.id);
       const mergedUpdatedAt =
         (c.updatedAt || '') > (existingConv.updatedAt || '')
           ? c.updatedAt
           : existingConv.updatedAt;
       convByPair.set(pairKey, {
         ...existingConv,
+        id: canonicalId,
+        participantIds: sortedPair,
         updatedAt: mergedUpdatedAt,
-        // If either version is not deleted, keep it visible when updated
-        deletedBy: (c.updatedAt || '') > (existingConv.updatedAt || '')
-          ? c.deletedBy || []
-          : existingConv.deletedBy || [],
+        deletedBy:
+          (c.updatedAt || '') > (existingConv.updatedAt || '')
+            ? c.deletedBy || []
+            : existingConv.deletedBy || [],
         clearedAt: { ...(existingConv.clearedAt || {}), ...(c.clearedAt || {}) },
       });
     }
@@ -413,6 +421,39 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
         deletedForEveryone: prev.deletedForEveryone || normalizedMsg.deletedForEveryone,
         deletedFor: Array.from(new Set([...(prev.deletedFor || []), ...(normalizedMsg.deletedFor || [])])),
       });
+    }
+  }
+
+  // Ensure every conversation that has messages exists in convByPair and has updatedAt >= latest message timestamp
+  for (const m of msgMap.values()) {
+    let matchingConv: ConversationRecord | undefined;
+    for (const c of convByPair.values()) {
+      if (c.id === m.conversationId) {
+        matchingConv = c;
+        break;
+      }
+    }
+    if (!matchingConv && m.senderId && m.recipientId) {
+      const sortedPair = [m.senderId, m.recipientId].sort() as [string, string];
+      const pairKey = sortedPair.join(':');
+      const canonicalId = getDeterministicConversationId(sortedPair[0], sortedPair[1]);
+      m.conversationId = canonicalId;
+      matchingConv = convByPair.get(pairKey);
+      if (!matchingConv) {
+        matchingConv = {
+          id: canonicalId,
+          participantIds: sortedPair,
+          createdAt: m.createdAt,
+          updatedAt: m.createdAt,
+          deletedBy: [],
+          clearedAt: {},
+        };
+        convByPair.set(pairKey, matchingConv);
+      }
+    }
+    if (matchingConv && m.createdAt > (matchingConv.updatedAt || '')) {
+      matchingConv.updatedAt = m.createdAt;
+      matchingConv.deletedBy = [];
     }
   }
 
@@ -456,6 +497,29 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
     }
   }
 
+  const statusViewKeySet = new Set<string>();
+  const mergedStatusViews: StatusViewRecord[] = [];
+  for (const sv of [...(base.statusViews || []), ...(incoming.statusViews || [])]) {
+    if (!sv || !sv.statusId || !sv.viewerId) continue;
+    const key = `${sv.statusId}:${sv.viewerId}`;
+    if (!statusViewKeySet.has(key)) {
+      statusViewKeySet.add(key);
+      mergedStatusViews.push({
+        id: sv.id || `stv_${crypto.randomBytes(6).toString('hex')}`,
+        statusId: sv.statusId,
+        viewerId: sv.viewerId,
+        viewedAt: sv.viewedAt || new Date().toISOString(),
+      });
+    }
+  }
+
+  const reportMap = new Map<string, ReportRecord>();
+  for (const rp of [...(base.reports || []), ...(incoming.reports || [])]) {
+    if (rp && rp.id) {
+      reportMap.set(rp.id, rp);
+    }
+  }
+
   return cleanParsedDatabase({
     users: Array.from(userMap.values()),
     sessions: Array.from(sessionMap.values()),
@@ -463,59 +527,58 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
     messages: Array.from(msgMap.values()),
     media: Array.from(mediaMap.values()),
     statuses: Array.from(statusMap.values()),
-    statusViews: base.statusViews || [],
+    statusViews: mergedStatusViews,
     blocks: mergedBlocks,
-    reports: base.reports || [],
+    reports: Array.from(reportMap.values()),
     contacts: mergedContacts,
   });
 }
 
-let lastCloudSyncMs = 0;
-let firestoreQuotaBackoffUntilMs = 0;
 export let lastFirestoreQuotaError: string | null = null;
+export let lastFirestoreCloudVerifiedAt: string | null = null;
 
-// Sync state from Firestore Cloud with quota circuit-breaker protection
-export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
-  const now = Date.now();
-  if (now < firestoreQuotaBackoffUntilMs) {
-    return;
+export async function ensureCloudDatabaseLoaded(_force = false): Promise<void> {
+  if (getActiveDbProvider() === 'supabase') {
+    const remoteDb = await loadDatabaseFromSupabase();
+    if (remoteDb) {
+      const hasRemoteUsers = Array.isArray(remoteDb.users) && remoteDb.users.length > 0;
+      if (hasRemoteUsers) {
+        // Supabase is authoritative: remote records take precedence over stale local cache
+        db = cleanParsedDatabase({
+          users: remoteDb.users || [],
+          sessions: remoteDb.sessions || [],
+          conversations: remoteDb.conversations || [],
+          messages: remoteDb.messages || [],
+          media: remoteDb.media && remoteDb.media.length > 0 ? remoteDb.media : db.media,
+          statuses: remoteDb.statuses || [],
+          statusViews: remoteDb.statusViews || [],
+          blocks: remoteDb.blocks || [],
+          reports: remoteDb.reports || [],
+          contacts: remoteDb.contacts || [],
+        });
+      } else {
+        // Initial bootstrap if remote tables are completely empty
+        db = mergeDatabases(db, remoteDb);
+      }
+      return;
+    }
   }
-  const minInterval = force ? 1200 : 10000;
-  if (now - lastCloudSyncMs < minInterval) return;
-  lastCloudSyncMs = now;
+
   try {
-    const resState = await fetch(FIRESTORE_DOC_URL).catch(() => null);
-    if (resState) {
-      if (resState.status === 429) {
-        firestoreQuotaBackoffUntilMs = Date.now() + 60 * 1000; // 60s circuit breaker on 429 Quota Exceeded
-        lastFirestoreQuotaError =
-          'Firebase Firestore free daily quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Cross-device messages and updates cannot sync until the daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
-        return;
-      }
-      if (resState.status === 403) {
-        lastFirestoreQuotaError =
-          'Firebase Firestore returned HTTP 403 PERMISSION_DENIED. Please verify Firestore security rules for lamavi_public/app_state.';
-        return;
-      }
-      if (resState.ok) {
-        lastFirestoreQuotaError = null;
-        const docData = await resState.json();
-        const rawJson = docData?.fields?.stateJson?.stringValue;
-        if (typeof rawJson === 'string') {
-          const parsed = JSON.parse(rawJson) as Partial<DatabaseSchema>;
-          db = mergeDatabases(db, parsed);
-        }
-      }
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      const localParsed = cleanParsedDatabase(JSON.parse(raw) as DatabaseSchema);
+      db = mergeDatabases(db, localParsed);
     }
   } catch {
-    // Fallback to local persistent database seamlessly
+    // Keep existing in-memory state
   }
 }
 
 export async function saveDatabase(
   data: DatabaseSchema = db,
   syncMedia = false
-): Promise<{ ok: boolean; error?: string; status?: number }> {
+): Promise<{ ok: boolean; error?: string; status?: number; cloudPersisted?: boolean }> {
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -527,119 +590,21 @@ export async function saveDatabase(
     // Ignore read-only filesystem errors on serverless
   }
 
-  // Respect Firestore 429 quota circuit-breaker
-  if (Date.now() < firestoreQuotaBackoffUntilMs && lastFirestoreQuotaError) {
-    return {
-      ok: !isVercel,
-      status: 429,
-      error: lastFirestoreQuotaError,
-    };
+  if (getActiveDbProvider() === 'supabase') {
+    const supRes = await saveDatabaseToSupabase(data, syncMedia);
+    if (!supRes.ok) {
+      return {
+        ok: false,
+        error: supRes.error,
+        status: supRes.status || 503,
+        cloudPersisted: false,
+      };
+    }
   }
 
-  // IMPORTANT: Await the Firestore write directly (do NOT use setTimeout) so Vercel serverless functions do not freeze before persisting to Firestore!
-  try {
-    const sessionsMap: Record<string, string> = {};
-    for (const s of data.sessions) {
-      sessionsMap[s.token] = s.userId;
-    }
-    const usersWithDigests = data.users.map((u) => ({
-      ...u,
-      passwordDigest: u.passwordHash,
-      recoveryDigest: u.recoveryCodeHash,
-    }));
-    const coreCopy = {
-      users: usersWithDigests,
-      sessions: data.sessions.slice(-200),
-      sessionsMap,
-      conversations: data.conversations,
-      messages: data.messages.slice(-500),
-      statuses: data.statuses,
-      statusViews: data.statusViews,
-      blocks: data.blocks,
-      contacts: data.contacts,
-      media: [],
-    };
-    const serializedCore = JSON.stringify(coreCopy);
-    if (serializedCore.length < 950000) {
-      const patchRes = await fetch(FIRESTORE_DOC_URL, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          fields: {
-            stateJson: { stringValue: serializedCore },
-            updatedAt: { stringValue: new Date().toISOString() },
-          },
-        }),
-      }).catch(() => null);
-
-      if (!patchRes) {
-        return {
-          ok: !isVercel,
-          status: 503,
-          error: 'Could not reach Firebase Firestore to persist data across devices.',
-        };
-      }
-
-      if (patchRes.status === 429) {
-        firestoreQuotaBackoffUntilMs = Date.now() + 60 * 1000;
-        lastFirestoreQuotaError =
-          'Firebase Firestore free daily write/read quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Cross-device messages cannot be saved to Firestore until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
-        return {
-          ok: !isVercel,
-          status: 429,
-          error: lastFirestoreQuotaError,
-        };
-      }
-
-      if (!patchRes.ok) {
-        const errText = await patchRes.text().catch(() => '');
-        return {
-          ok: !isVercel,
-          status: patchRes.status,
-          error: `Firestore write failed (HTTP ${patchRes.status}): ${errText.slice(0, 180)}`,
-        };
-      }
-
-      lastFirestoreQuotaError = null;
-    }
-
-    if (syncMedia) {
-      const fittingMedia: MediaRecord[] = [];
-      let currentLen = 20;
-      for (let i = data.media.length - 1; i >= 0; i--) {
-        const itemStr = JSON.stringify(data.media[i]);
-        if (currentLen + itemStr.length < 850000) {
-          fittingMedia.unshift(data.media[i]);
-          currentLen += itemStr.length + 2;
-        }
-      }
-      const serializedMedia = JSON.stringify({ media: fittingMedia });
-      await fetch(FIRESTORE_MEDIA_URL, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          fields: {
-            stateJson: { stringValue: serializedMedia },
-            updatedAt: { stringValue: new Date().toISOString() },
-          },
-        }),
-      }).catch(() => {});
-    }
-    return { ok: true };
-  } catch (err) {
-    return {
-      ok: !isVercel,
-      status: 500,
-      error: err instanceof Error ? err.message : 'Database write error',
-    };
-  }
+  return { ok: true, cloudPersisted: true };
 }
 
-// Initial cloud sync check on startup
 ensureCloudDatabaseLoaded(true);
 
 function hashSecret(
@@ -1084,12 +1049,23 @@ export function createApiApp(
       expiresAt,
     });
 
-    await saveDatabase();
+    const saveRes = await saveDatabase();
+    if (!saveRes.ok) {
+      db.users = db.users.filter((u) => u.id !== newUser.id);
+      db.sessions = db.sessions.filter((s) => s.token !== token);
+      res.status(saveRes.status || 503).json({
+        error:
+          saveRes.error ||
+          'Failed to persist new account to Firebase Firestore. Please try again after Firestore quota resets.',
+      });
+      return;
+    }
 
     res.status(201).json({
       token,
       user: sanitizeUserForViewer(newUser, newUser.id),
       recoveryCode: plainRecoveryCode,
+      cloudPersisted: true,
     });
   });
 
@@ -1214,6 +1190,9 @@ export function createApiApp(
       ? authHeader.slice(7).trim()
       : '';
     db.sessions = db.sessions.filter((s) => s.token !== token);
+    if (token) {
+      await deleteTableRowWhere('lamavi_sessions', `token=eq.${encodeURIComponent(token)}`).catch(() => {});
+    }
     await saveDatabase();
     res.json({ success: true });
   });
@@ -1396,6 +1375,10 @@ export function createApiApp(
     db.conversations = db.conversations.filter((c) => !convIds.has(c.id));
     db.messages = db.messages.filter((m) => !convIds.has(m.conversationId));
 
+    for (const cid of convIds) {
+      await deleteTableRowWhere('lamavi_conversations', `id=eq.${encodeURIComponent(cid)}`).catch(() => {});
+    }
+    await deleteTableRowWhere('lamavi_users', `id=eq.${encodeURIComponent(uid)}`).catch(() => {});
     await saveDatabase();
     res.json({ success: true });
   });
@@ -1640,6 +1623,10 @@ export function createApiApp(
     db.contacts = db.contacts.filter(
       (c) => !(c.userId === user.id && c.contactUserId === targetUserId)
     );
+    await deleteTableRowWhere(
+      'lamavi_contacts',
+      `user_id=eq.${encodeURIComponent(user.id)}&contact_user_id=eq.${encodeURIComponent(targetUserId)}`
+    ).catch(() => {});
     if (db.contacts.length !== beforeCount) {
       await saveDatabase();
     }
@@ -1675,6 +1662,12 @@ export function createApiApp(
     db.blocks = db.blocks.filter(
       (b) => !(b.blockerId === user.id && b.blockedUserId === targetUserId)
     );
+    if (targetUserId) {
+      await deleteTableRowWhere(
+        'lamavi_blocks',
+        `blocker_id=eq.${encodeURIComponent(user.id)}&blocked_user_id=eq.${encodeURIComponent(String(targetUserId))}`
+      ).catch(() => {});
+    }
     await saveDatabase();
     res.json({ success: true });
   });
@@ -2040,7 +2033,15 @@ export function createApiApp(
       conv.deletedBy = conv.deletedBy.filter((id) => id !== user.id);
     }
 
-    await saveDatabase();
+    const saveRes = await saveDatabase();
+    if (!saveRes.ok) {
+      res.status(saveRes.status || 503).json({
+        error:
+          saveRes.error ||
+          'Failed to save conversation to Supabase database. Please check database connectivity.',
+      });
+      return;
+    }
     const formattedList = getConversationsForUser(user.id);
     const formatted = formattedList.find((c) => c.id === conv!.id);
     res.json({ conversation: formatted });
@@ -2077,18 +2078,37 @@ export function createApiApp(
       }
 
       const clearedAfter = conv.clearedAt[user.id] || '';
-      const messages = db.messages
+      const beforeCursor =
+        typeof req.query.before === 'string' ? req.query.before.trim() : '';
+      const rawLimit =
+        typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : 100;
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(Math.max(rawLimit, 1), 200)
+        : 100;
+
+      let allVisible = db.messages
         .filter(
           (m) =>
             m.conversationId === conv!.id &&
             !m.deletedFor.includes(user.id) &&
             (!clearedAfter || m.createdAt > clearedAfter)
         )
-        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-        .map((m) => formatMessageForUser(m, user.id));
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+      if (beforeCursor) {
+        allVisible = allVisible.filter((m) => m.createdAt < beforeCursor);
+      }
+
+      const hasMore = allVisible.length > limit;
+      const pageMessages = (
+        hasMore ? allVisible.slice(allVisible.length - limit) : allVisible
+      ).map((m) => formatMessageForUser(m, user.id));
+      const nextCursor = pageMessages.length > 0 ? pageMessages[0].createdAt : null;
 
       res.json({
-        messages,
+        messages: pageMessages,
+        hasMore,
+        nextCursor,
         conversationId: conv.id,
         quotaWarning: lastFirestoreQuotaError || undefined,
       });
@@ -2102,38 +2122,41 @@ export function createApiApp(
       await ensureCloudDatabaseLoaded(true);
       const user = (req as express.Request & { user: UserRecord }).user;
       const requestedConvId = req.params.conversationId;
-      const { text, imageId, replyToMessageId, clientTempId, recipientId, recipientUser } =
+      const { text, imageId, replyToMessageId, clientTempId, recipientId, recipientUser, targetUser } =
         req.body || {};
+      const effectiveRecipientUser = recipientUser || targetUser;
 
       let conv = db.conversations.find((c) => c.id === requestedConvId);
 
       // If cold serverless lambda didn't have the conversation record yet, find by pair or reconstruct deterministically
       if (!conv && recipientId && typeof recipientId === 'string' && recipientId !== user.id) {
+        const canonicalId = getDeterministicConversationId(user.id, recipientId);
         conv = db.conversations.find(
           (c) =>
-            c.participantIds.includes(user.id) &&
-            c.participantIds.includes(recipientId)
+            c.id === canonicalId ||
+            (c.participantIds.includes(user.id) &&
+              c.participantIds.includes(recipientId))
         );
         if (!conv) {
           let recipientRecord = db.users.find((u) => u.id === recipientId);
-          if (!recipientRecord && recipientUser && recipientUser.id && recipientUser.username) {
+          if (!recipientRecord && effectiveRecipientUser && effectiveRecipientUser.id && effectiveRecipientUser.username) {
             const nowStr = new Date().toISOString();
             recipientRecord = {
-              id: String(recipientUser.id),
-              fullName: String(recipientUser.fullName || recipientUser.username),
-              username: String(recipientUser.username).toLowerCase(),
+              id: String(effectiveRecipientUser.id),
+              fullName: String(effectiveRecipientUser.fullName || effectiveRecipientUser.username),
+              username: String(effectiveRecipientUser.username).toLowerCase(),
               email: String(
-                recipientUser.email || `${recipientUser.username}@gmail.com`
+                effectiveRecipientUser.email || `${effectiveRecipientUser.username}@gmail.com`
               ).toLowerCase(),
               passwordSalt: 'sha256_client',
               passwordHash: '',
               recoveryCodeSalt: 'sha256_client',
               recoveryCodeHash: '',
-              bio: String(recipientUser.bio || ''),
-              avatarUrl: String(recipientUser.avatarUrl || ''),
+              bio: String(effectiveRecipientUser.bio || ''),
+              avatarUrl: String(effectiveRecipientUser.avatarUrl || ''),
               createdAt: nowStr,
               lastSeen: nowStr,
-              isOnline: Boolean(recipientUser.isOnline),
+              isOnline: Boolean(effectiveRecipientUser.isOnline),
               usernameChangeTimestamps: [],
               privacy: {
                 profilePicVisibility: 'everyone',
@@ -2159,9 +2182,7 @@ export function createApiApp(
           const nowStr = new Date().toISOString();
           const sortedPair = [user.id, recipientId].sort() as [string, string];
           conv = {
-            id: requestedConvId.startsWith('conv_')
-              ? requestedConvId
-              : getDeterministicConversationId(user.id, recipientId),
+            id: canonicalId,
             participantIds: sortedPair,
             createdAt: nowStr,
             updatedAt: nowStr,
@@ -2256,7 +2277,7 @@ export function createApiApp(
         res.status(saveResult.status || 503).json({
           error:
             saveResult.error ||
-            'Failed to persist message to Firebase Firestore. Please retry.',
+            'Failed to persist message to Supabase database. Please retry.',
         });
         return;
       }
@@ -2585,6 +2606,7 @@ export function createApiApp(
 
     db.statuses = db.statuses.filter((s) => s.id !== status.id);
     db.statusViews = db.statusViews.filter((sv) => sv.statusId !== status.id);
+    await deleteTableRowWhere('lamavi_statuses', `id=eq.${encodeURIComponent(status.id)}`).catch(() => {});
     await saveDatabase();
 
     for (const u of db.users) {
@@ -2616,12 +2638,39 @@ export function createApiApp(
       0
     );
 
+    const adapterStatus = getSupabaseAdapterStatus();
+
     res.json({
       conversationsCount: myConvIds.size,
       messageCount,
       mediaCount: mediaItems.length,
       totalMediaBytes,
       retentionDays: 7,
+      activeDatabaseProvider: adapterStatus.provider,
+      supabaseAdapter: adapterStatus,
+    });
+  });
+
+  // --- PRE-MIGRATION LOCAL DATA BACKUP / EXPORT ---
+  app.get('/api/storage/backup', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
+    const user = (req as express.Request & { user: UserRecord }).user;
+    const myConvs = db.conversations.filter((c) =>
+      c.participantIds.includes(user.id)
+    );
+    const myConvIds = new Set(myConvs.map((c) => c.id));
+    const myMessages = db.messages.filter(
+      (m) => myConvIds.has(m.conversationId) && !m.deletedFor.includes(user.id)
+    );
+    const myContacts = db.contacts.filter((c) => c.userId === user.id);
+
+    res.json({
+      exportedAt: new Date().toISOString(),
+      provider: 'local',
+      user: sanitizeUserForViewer(user, user.id),
+      contacts: myContacts,
+      conversations: myConvs,
+      messages: myMessages,
     });
   });
 

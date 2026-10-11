@@ -1,5 +1,3 @@
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { db as clientDb } from '../firebase';
 import {
   UserProfile,
   ConversationItem,
@@ -9,6 +7,7 @@ import {
   NotificationSettings,
   ChatSettings,
 } from '../types';
+import seedDatabaseRaw from '../../data/seed_database.json';
 
 interface StoredUser {
   id: string;
@@ -80,9 +79,9 @@ interface StoredStatus {
   viewers: { viewerId: string; viewedAt: string }[];
 }
 
-interface CloudState {
+interface LocalState {
   users: StoredUser[];
-  sessions: Record<string, string>; // token -> userId
+  sessions: Record<string, string>;
   conversations: StoredConversation[];
   messages: StoredMessage[];
   media: StoredMedia[];
@@ -93,7 +92,7 @@ interface CloudState {
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-const LOCAL_CLOUD_KEY = 'lamavi_cloud_fallback_state_v2';
+const LOCAL_STORAGE_KEY = 'lamavi_local_state_v3';
 
 async function sha256Hex(input: string): Promise<string> {
   const enc = new TextEncoder().encode(input);
@@ -117,7 +116,7 @@ async function getDeterministicClientConvId(userA: string, userB: string): Promi
   return `conv_${digest.slice(0, 16)}`;
 }
 
-// BroadcastChannel for instant zero-latency real-time sync across tabs/windows on the same device
+// BroadcastChannel for instant real-time sync across tabs/windows on the same device
 const lamaviBroadcast =
   typeof window !== 'undefined' && 'BroadcastChannel' in window
     ? new BroadcastChannel('lamavi_realtime_sync')
@@ -125,23 +124,15 @@ const lamaviBroadcast =
 
 export function notifyRealtimeSync(event: string, payload?: unknown) {
   try {
-    lamaviBroadcast?.postMessage({ event, payload, timestamp: Date.now() });
+    lamaviBroadcast?.postMessage({
+      type: 'state_updated',
+      event,
+      payload,
+      timestamp: Date.now(),
+    });
   } catch {
     // ignore
   }
-}
-
-export function subscribeRealtimeSync(
-  callback: (data: { event: string; payload?: unknown; timestamp: number }) => void
-): () => void {
-  if (!lamaviBroadcast) return () => {};
-  const handler = (e: MessageEvent) => {
-    if (e.data && typeof e.data.event === 'string') {
-      callback(e.data);
-    }
-  };
-  lamaviBroadcast.addEventListener('message', handler);
-  return () => lamaviBroadcast.removeEventListener('message', handler);
 }
 
 function generateClientRecoveryCode(): string {
@@ -155,7 +146,7 @@ function generateClientRecoveryCode(): string {
   return `LAMAVI-${p1}-${p2}`;
 }
 
-function emptyState(): CloudState {
+function emptyState(): LocalState {
   return {
     users: [],
     sessions: {},
@@ -168,7 +159,7 @@ function emptyState(): CloudState {
   };
 }
 
-function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
+function mergeLocalStates(a: LocalState, b: LocalState): LocalState {
   const userMap = new Map<string, StoredUser>();
   for (const u of [...(a.users || []), ...(b.users || [])]) {
     const key = (u.username || '').toLowerCase();
@@ -177,15 +168,24 @@ function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
     if (!prev) {
       userMap.set(key, u);
     } else {
+      const incomingNewer =
+        (u.lastSeen || u.createdAt || '') >= (prev.lastSeen || prev.createdAt || '');
       userMap.set(key, {
         ...prev,
-        ...u,
+        ...(incomingNewer ? u : {}),
         id: prev.id || u.id,
-        avatarUrl: u.avatarUrl || prev.avatarUrl,
-        bio: u.bio || prev.bio,
-        fullName: u.fullName || prev.fullName,
-        passwordDigest: u.passwordDigest || prev.passwordDigest,
-        recoveryDigest: u.recoveryDigest || prev.recoveryDigest,
+        avatarUrl:
+          (incomingNewer && u.avatarUrl ? u.avatarUrl : prev.avatarUrl) || u.avatarUrl || '',
+        bio: (incomingNewer && u.bio !== undefined ? u.bio : prev.bio) || u.bio || '',
+        fullName: (incomingNewer && u.fullName ? u.fullName : prev.fullName) || u.fullName || '',
+        passwordDigest:
+          (incomingNewer && u.passwordDigest ? u.passwordDigest : prev.passwordDigest) ||
+          u.passwordDigest ||
+          '',
+        recoveryDigest:
+          (incomingNewer && u.recoveryDigest ? u.recoveryDigest : prev.recoveryDigest) ||
+          u.recoveryDigest ||
+          '',
       });
     }
   }
@@ -199,11 +199,13 @@ function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
   const convIdRemap = new Map<string, string>();
   for (const c of [...(a.conversations || []), ...(b.conversations || [])]) {
     if (!c || !Array.isArray(c.participantIds) || c.participantIds.length < 2) continue;
-    const pairKey = [c.participantIds[0], c.participantIds[1]].sort().join(':');
+    const sortedPair = [c.participantIds[0], c.participantIds[1]].sort() as [string, string];
+    const pairKey = sortedPair.join(':');
     const existingConv = convByPair.get(pairKey);
     if (!existingConv) {
       convByPair.set(pairKey, {
         ...c,
+        participantIds: sortedPair,
         deletedBy: Array.isArray(c.deletedBy) ? c.deletedBy : [],
         clearedAt: c.clearedAt || {},
       });
@@ -216,6 +218,7 @@ function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
           : existingConv.updatedAt;
       convByPair.set(pairKey, {
         ...existingConv,
+        participantIds: sortedPair,
         updatedAt: mergedUpdatedAt,
         deletedBy:
           (c.updatedAt || '') > (existingConv.updatedAt || '')
@@ -252,6 +255,15 @@ function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
         deliveredAt: normalized.deliveredAt || prev.deliveredAt,
         readAt: normalized.readAt || prev.readAt,
       });
+    }
+  }
+
+  for (const m of msgMap.values()) {
+    for (const c of convByPair.values()) {
+      if (c.id === m.conversationId && m.createdAt > (c.updatedAt || '')) {
+        c.updatedAt = m.createdAt;
+        c.deletedBy = [];
+      }
     }
   }
 
@@ -297,7 +309,7 @@ function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
   };
 }
 
-function normalizeParsedCloudState(rawObj: Record<string, unknown>): CloudState {
+function normalizeParsedLocalState(rawObj: Record<string, unknown>): LocalState {
   const base = emptyState();
   const rawUsers = Array.isArray(rawObj.users) ? rawObj.users : [];
   base.users = rawUsers.map((u: Record<string, unknown>) => ({
@@ -364,58 +376,26 @@ function normalizeParsedCloudState(rawObj: Record<string, unknown>): CloudState 
   return base;
 }
 
-import seedDatabaseRaw from '../../data/seed_database.json';
-
-let clientQuotaBackoffUntilMs = 0;
-let lastClientCloudReadMs = 0;
-let lastClientQuotaErrorMsg: string | null = null;
-
-async function readCloudState(force = false): Promise<CloudState> {
-  const seedState = normalizeParsedCloudState(
+function readLocalState(): LocalState {
+  const seedState = normalizeParsedLocalState(
     seedDatabaseRaw as unknown as Record<string, unknown>
   );
-  let cloudState: CloudState = emptyState();
-  let localState: CloudState = emptyState();
+  let localState: LocalState = emptyState();
 
   try {
-    const raw = localStorage.getItem(LOCAL_CLOUD_KEY);
+    const raw =
+      localStorage.getItem(LOCAL_STORAGE_KEY) ||
+      localStorage.getItem('lamavi_cloud_fallback_state_v2');
     if (raw) {
-      localState = normalizeParsedCloudState(JSON.parse(raw));
+      localState = normalizeParsedLocalState(JSON.parse(raw));
     }
   } catch {
     // ignore
   }
 
-  const now = Date.now();
-  const canReadFirestore =
-    now >= clientQuotaBackoffUntilMs && (force || now - lastClientCloudReadMs >= 30000);
-
-  if (canReadFirestore) {
-    lastClientCloudReadMs = now;
-    try {
-      const snapState = await getDoc(doc(clientDb, 'lamavi_public', 'app_state'));
-      if (snapState && snapState.exists()) {
-        lastClientQuotaErrorMsg = null;
-        const data = snapState.data();
-        if (data && typeof data.stateJson === 'string') {
-          cloudState = normalizeParsedCloudState(JSON.parse(data.stateJson));
-        }
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.includes('resource-exhausted') || errMsg.includes('Quota exceeded') || errMsg.includes('429')) {
-        clientQuotaBackoffUntilMs = Date.now() + 60 * 1000;
-        lastClientQuotaErrorMsg =
-          'Firebase Firestore free daily quota (429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Cross-device messages and new accounts cannot sync until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
-      }
-    }
-  }
-
-  const mergedSeedAndCloud = mergeCloudStates(seedState, cloudState);
-  const resolved = mergeCloudStates(mergedSeedAndCloud, localState);
+  const resolved = mergeLocalStates(seedState, localState);
   const nowIso = new Date().toISOString();
 
-  // Enforce 7-day message/media expiration & 24-hour status expiration
   resolved.messages = (resolved.messages || []).filter((m) => !m.expiresAt || m.expiresAt > nowIso);
   resolved.media = (resolved.media || []).filter((med) => !med.expiresAt || med.expiresAt > nowIso);
   resolved.statuses = (resolved.statuses || []).filter((s) => !s.expiresAt || s.expiresAt > nowIso);
@@ -423,67 +403,16 @@ async function readCloudState(force = false): Promise<CloudState> {
   return resolved;
 }
 
-async function writeCloudState(
-  state: CloudState,
-  syncMedia = false,
-  skipFirestore = false
-): Promise<{ ok: boolean; error?: string }> {
+function writeLocalState(state: LocalState): void {
   try {
-    localStorage.setItem(LOCAL_CLOUD_KEY, JSON.stringify(state));
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state));
+    localStorage.removeItem('lamavi_cloud_fallback_state_v2');
   } catch {
     // ignore
   }
-  if (skipFirestore) {
-    return { ok: true };
-  }
-  if (Date.now() < clientQuotaBackoffUntilMs && lastClientQuotaErrorMsg) {
-    return { ok: false, error: lastClientQuotaErrorMsg };
-  }
-  try {
-    const coreState: CloudState = {
-      ...state,
-      messages: state.messages.slice(-500),
-      media: [],
-    };
-    const stateJson = JSON.stringify(coreState);
-    if (stateJson.length < 950000) {
-      await setDoc(doc(clientDb, 'lamavi_public', 'app_state'), {
-        stateJson,
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    if (syncMedia) {
-      const fittingMedia: StoredMedia[] = [];
-      let currentLen = 20;
-      for (let i = state.media.length - 1; i >= 0; i--) {
-        const itemStr = JSON.stringify(state.media[i]);
-        if (currentLen + itemStr.length < 850000) {
-          fittingMedia.unshift(state.media[i]);
-          currentLen += itemStr.length + 2;
-        }
-      }
-      const mediaJson = JSON.stringify({ media: fittingMedia });
-      await setDoc(doc(clientDb, 'lamavi_public', 'app_media'), {
-        stateJson: mediaJson,
-        updatedAt: new Date().toISOString(),
-      });
-    }
-    lastClientQuotaErrorMsg = null;
-    return { ok: true };
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    if (errMsg.includes('resource-exhausted') || errMsg.includes('Quota exceeded') || errMsg.includes('429')) {
-      clientQuotaBackoffUntilMs = Date.now() + 60 * 1000;
-      lastClientQuotaErrorMsg =
-        'Firebase Firestore free daily quota (429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89.';
-      return { ok: false, error: lastClientQuotaErrorMsg };
-    }
-    return { ok: false, error: errMsg };
-  }
 }
 
-function toUserProfile(u: StoredUser, viewerId: string, state: CloudState): UserProfile {
+function toUserProfile(u: StoredUser, viewerId: string, state: LocalState): UserProfile {
   const isSelf = u.id === viewerId;
   const thirtyDaysAgo = new Date(Date.now() - THIRTY_DAYS_MS).toISOString();
   const recentChanges = (u.usernameChangeTimestamps || []).filter((ts) => ts > thirtyDaysAgo);
@@ -529,17 +458,16 @@ function toUserProfile(u: StoredUser, viewerId: string, state: CloudState): User
   };
 }
 
-// Intercept `/api/*` calls automatically when running on a static host where the backend returns 404/HTML or throws a network error
-export function installServerlessFallbackInterceptor() {
+export function installLocalFallbackInterceptor() {
   const originalFetch = window.fetch.bind(window);
 
   const wrappedFetch: typeof window.fetch = async (input, init) => {
-    const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const urlStr =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     if (!urlStr.startsWith('/api/')) {
       return originalFetch(input, init);
     }
 
-    // Attach current user profile header so cold serverless instances can recover session seamlessly
     const mergedHeaders = new Headers(init?.headers || {});
     try {
       const cachedUserRaw = localStorage.getItem('lamavi_current_user');
@@ -569,7 +497,6 @@ export function installServerlessFallbackInterceptor() {
       const response = await originalFetch(input, nextInit);
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
-        // When register or login succeeds on backend, mirror the user & token into local fallback cache ONLY (skipFirestore = true because backend already persisted to Firestore)
         if (
           response.ok &&
           (urlStr.startsWith('/api/auth/register') ||
@@ -581,7 +508,7 @@ export function installServerlessFallbackInterceptor() {
             .json()
             .then(async (data) => {
               if (data && data.user) {
-                const st = await readCloudState(false);
+                const st = readLocalState();
                 const existingIdx = st.users.findIndex(
                   (u) =>
                     u.id === data.user.id ||
@@ -645,13 +572,12 @@ export function installServerlessFallbackInterceptor() {
                 if (data.token) {
                   st.sessions[data.token] = data.user.id;
                 }
-                await writeCloudState(st, false, true);
+                writeLocalState(st);
               }
             })
             .catch(() => {});
         }
 
-        // Also mirror sent messages and started conversations into local fallback cache so multi-tab BroadcastChannel sync works immediately
         if (
           response.ok &&
           init?.method === 'POST' &&
@@ -661,8 +587,8 @@ export function installServerlessFallbackInterceptor() {
           response
             .clone()
             .json()
-            .then(async (data) => {
-              const st = await readCloudState(false);
+            .then((data) => {
+              const st = readLocalState();
               if (data.conversation && data.conversation.id && data.conversation.recipient) {
                 const cachedUserRaw = localStorage.getItem('lamavi_current_user');
                 const me = cachedUserRaw ? JSON.parse(cachedUserRaw) : null;
@@ -697,7 +623,7 @@ export function installServerlessFallbackInterceptor() {
                   c.deletedBy = [];
                 }
               }
-              await writeCloudState(st, false, true);
+              writeLocalState(st);
               notifyRealtimeSync('message:sync', {
                 conversationId: data.message?.conversationId || data.conversation?.id,
               });
@@ -705,7 +631,6 @@ export function installServerlessFallbackInterceptor() {
             .catch(() => {});
         }
 
-        // If backend returned 401 on login or recover, check client cloud fallback in case the account was created on another static/mobile instance
         if (
           response.status === 401 &&
           (urlStr.startsWith('/api/auth/login') || urlStr.startsWith('/api/auth/recover'))
@@ -716,7 +641,6 @@ export function installServerlessFallbackInterceptor() {
           }
         }
 
-        // If backend returned 401 on an authenticated route on a cold serverless instance, verify against Firebase cloud fallback before failing
         if (
           response.status === 401 &&
           !urlStr.startsWith('/api/auth/login') &&
@@ -727,7 +651,7 @@ export function installServerlessFallbackInterceptor() {
             return fallbackRes;
           }
         }
-        // If this was a user search that returned null on the backend, also check client cloud state as a safety net
+
         if (urlStr.startsWith('/api/users/search') && response.ok) {
           const clone = response.clone();
           const data = await clone.json();
@@ -743,7 +667,7 @@ export function installServerlessFallbackInterceptor() {
         return response;
       }
     } catch {
-      // Network error reaching `/api/*` -> fall through to Firebase Cloud handler
+      // Network error reaching `/api/*` -> fall through to local handler
     }
 
     return handleFallbackApiRequest(urlStr, nextInit);
@@ -752,7 +676,7 @@ export function installServerlessFallbackInterceptor() {
   try {
     window.fetch = wrappedFetch;
   } catch {
-    // ignore if locked by extension
+    // ignore
   }
 }
 
@@ -773,7 +697,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   const authHeader = headers.get('Authorization') || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
 
-  const state = await readCloudState();
+  const state = readLocalState();
   let currentUserId = token ? state.sessions[token] : undefined;
   if (!currentUserId && token.startsWith('lmv.')) {
     const parts = token.split('.');
@@ -828,7 +752,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
             };
             state.users.push(recovered);
             state.sessions[token] = recovered.id;
-            await writeCloudState(state);
+            writeLocalState(state);
             currentUser = recovered;
           }
         }
@@ -903,7 +827,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     const newToken = `lmv.${newUser.id}.${randomHex(24)}`;
     state.users.push(newUser);
     state.sessions[newToken] = newUser.id;
-    await writeCloudState(state);
+    writeLocalState(state);
 
     return jsonResponse(201, {
       token: newToken,
@@ -944,7 +868,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     user.isOnline = true;
     const newToken = `lmv.${user.id}.${randomHex(24)}`;
     state.sessions[newToken] = user.id;
-    await writeCloudState(state);
+    writeLocalState(state);
     return jsonResponse(200, {
       token: newToken,
       user: toUserProfile(user, user.id, state),
@@ -974,7 +898,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       return jsonResponse(401, { error: 'Invalid account identifier or recovery code.' });
     }
     user.passwordDigest = await sha256Hex(String(newPassword).trim());
-    await writeCloudState(state);
+    writeLocalState(state);
     return jsonResponse(200, { message: 'Password updated! You can now log in.' });
   }
 
@@ -985,13 +909,13 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   if (pathname === '/api/auth/me' && method === 'GET') {
     currentUser.lastSeen = new Date().toISOString();
     currentUser.isOnline = true;
-    await writeCloudState(state);
+    writeLocalState(state);
     return jsonResponse(200, { user: toUserProfile(currentUser, currentUser.id, state) });
   }
 
   if (pathname === '/api/auth/logout' && method === 'POST') {
     delete state.sessions[token];
-    await writeCloudState(state);
+    writeLocalState(state);
     return jsonResponse(200, { success: true });
   }
 
@@ -1040,7 +964,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     if (chatSettings) currentUser.chatSettings = { ...currentUser.chatSettings, ...chatSettings };
 
     currentUser.lastSeen = new Date().toISOString();
-    await writeCloudState(state);
+    writeLocalState(state);
     return jsonResponse(200, { user: toUserProfile(currentUser, currentUser.id, state) });
   }
 
@@ -1099,13 +1023,6 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
           error: 'This is your own account! Enter the other person’s username or Gmail to connect.',
         });
       }
-      if (lastClientQuotaErrorMsg) {
-        return jsonResponse(503, {
-          error: lastClientQuotaErrorMsg,
-          result: null,
-          results: [],
-        });
-      }
       return jsonResponse(200, { result: null, results: [] });
     }
     return jsonResponse(200, {
@@ -1114,7 +1031,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     });
   }
 
-  // Contacts (strictly explicit connections)
+  // Contacts
   if (pathname === '/api/contacts' && method === 'GET') {
     const contactIds = new Set<string>();
     for (const c of state.contacts) {
@@ -1169,7 +1086,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       )
     ) {
       state.contacts.push({ userId: currentUser.id, contactUserId: targetUserId });
-      await writeCloudState(state);
+      writeLocalState(state);
     }
     return jsonResponse(200, {
       contact: { ...toUserProfile(target, currentUser.id, state), isContact: true },
@@ -1184,7 +1101,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     state.contacts = state.contacts.filter(
       (c) => !(c.userId === currentUser.id && c.contactUserId === targetUserId)
     );
-    await writeCloudState(state);
+    writeLocalState(state);
     return jsonResponse(200, { success: true, targetUserId });
   }
 
@@ -1197,7 +1114,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       )
     ) {
       state.blocks.push({ blockerId: currentUser.id, blockedUserId: targetUserId });
-      await writeCloudState(state);
+      writeLocalState(state);
     }
     return jsonResponse(200, { success: true });
   }
@@ -1207,7 +1124,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     state.blocks = state.blocks.filter(
       (b) => !(b.blockerId === currentUser.id && b.blockedUserId === targetUserId)
     );
-    await writeCloudState(state);
+    writeLocalState(state);
     return jsonResponse(200, { success: true });
   }
 
@@ -1302,16 +1219,18 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       };
       state.users.push(recipient);
     }
-    if (!recipient) return jsonResponse(404, { error: 'No user found.' });
+    if (!recipient) return jsonResponse(404, { error: 'User not found.' });
+
     let conv = state.conversations.find(
       (c) =>
-        c.participantIds.includes(currentUser.id) && c.participantIds.includes(recipientId)
+        c.participantIds.includes(currentUser.id) && c.participantIds.includes(recipient.id)
     );
     const now = new Date().toISOString();
     if (!conv) {
-      const sortedPair = [currentUser.id, recipientId].sort() as [string, string];
+      const sortedPair = [currentUser.id, recipient.id].sort() as [string, string];
+      const canonicalId = await getDeterministicClientConvId(currentUser.id, recipient.id);
       conv = {
-        id: await getDeterministicClientConvId(currentUser.id, recipientId),
+        id: canonicalId,
         participantIds: sortedPair,
         createdAt: now,
         updatedAt: now,
@@ -1322,7 +1241,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     } else {
       conv.deletedBy = conv.deletedBy.filter((id) => id !== currentUser.id);
     }
-    await writeCloudState(state);
+    writeLocalState(state);
     notifyRealtimeSync('message:sync', { conversationId: conv.id });
     return jsonResponse(200, {
       conversation: {
@@ -1340,24 +1259,21 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
 
   const msgMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
   if (msgMatch) {
-    const convId = msgMatch[1];
-    let conv = state.conversations.find((c) => c.id === convId);
-    const recipientIdParam =
-      url.searchParams.get('recipientId') ||
-      (typeof bodyObj.recipientId === 'string' ? bodyObj.recipientId : '');
-    if (!conv && recipientIdParam) {
+    const requestedConvId = msgMatch[1];
+    let conv = state.conversations.find((c) => c.id === requestedConvId);
+    if (!conv && method === 'POST' && bodyObj.recipientId) {
+      const recId = String(bodyObj.recipientId);
+      const canonicalId = await getDeterministicClientConvId(currentUser.id, recId);
       conv = state.conversations.find(
         (c) =>
-          c.participantIds.includes(currentUser.id) &&
-          c.participantIds.includes(recipientIdParam)
+          c.id === canonicalId ||
+          (c.participantIds.includes(currentUser.id) && c.participantIds.includes(recId))
       );
-      if (!conv && method === 'POST') {
+      if (!conv) {
         const nowStr = new Date().toISOString();
-        const sortedPair = [currentUser.id, recipientIdParam].sort() as [string, string];
+        const sortedPair = [currentUser.id, recId].sort() as [string, string];
         conv = {
-          id: convId.startsWith('conv_')
-            ? convId
-            : await getDeterministicClientConvId(currentUser.id, recipientIdParam),
+          id: canonicalId,
           participantIds: sortedPair,
           createdAt: nowStr,
           updatedAt: nowStr,
@@ -1367,59 +1283,52 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
         state.conversations.push(conv);
       }
     }
-    if (!conv) return jsonResponse(404, { error: 'Conversation not found.' });
+    if (!conv || !conv.participantIds.includes(currentUser.id)) {
+      return jsonResponse(403, { error: 'Unauthorized.' });
+    }
+    const convId = conv.id;
     if (method === 'GET') {
       const clearedAfter = conv.clearedAt[currentUser.id] || '';
       const messages = state.messages
         .filter(
           (m) =>
-            m.conversationId === conv!.id &&
+            m.conversationId === convId &&
             !m.deletedFor.includes(currentUser.id) &&
             (!clearedAfter || m.createdAt > clearedAfter)
         )
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-        .map((m) =>
-          m.deletedForEveryone
-            ? {
-                ...m,
-                text: 'This message was deleted',
-                imageId: undefined,
-                isDeletedPlaceholder: true,
-              }
-            : m
-        );
-      return jsonResponse(200, { messages, conversationId: conv.id });
+        .map((m) => ({
+          ...m,
+          text: m.deletedForEveryone ? 'This message was deleted' : m.text,
+          imageId: m.deletedForEveryone ? undefined : m.imageId,
+          isDeletedPlaceholder: m.deletedForEveryone,
+        }));
+      return jsonResponse(200, { messages, conversationId: convId });
     }
     if (method === 'POST') {
       const { text, imageId, replyToMessageId, clientTempId } = bodyObj;
       const now = new Date();
+      const nowIso = now.toISOString();
       const newMsg: StoredMessage = {
         id: `msg_${randomHex(8)}`,
-        clientTempId,
-        conversationId: conv.id,
+        clientTempId: clientTempId ? String(clientTempId) : undefined,
+        conversationId: convId,
         senderId: currentUser.id,
         text: String(text || '').trim(),
-        imageId,
-        replyToMessageId,
-        createdAt: now.toISOString(),
+        imageId: imageId ? String(imageId) : undefined,
+        replyToMessageId: replyToMessageId ? String(replyToMessageId) : undefined,
+        createdAt: nowIso,
         expiresAt: new Date(now.getTime() + SEVEN_DAYS_MS).toISOString(),
         status: 'delivered',
-        deliveredAt: now.toISOString(),
+        deliveredAt: nowIso,
         deletedFor: [],
         deletedForEveryone: false,
       };
-      conv.updatedAt = now.toISOString();
+      conv.updatedAt = nowIso;
       conv.deletedBy = [];
       state.messages.push(newMsg);
-      const writeRes = await writeCloudState(state);
-      notifyRealtimeSync('message:sync', { conversationId: conv.id });
-      if (!writeRes.ok) {
-        return jsonResponse(503, {
-          error:
-            writeRes.error ||
-            'Failed to persist message to Firebase Firestore across devices.',
-        });
-      }
+      writeLocalState(state);
+      notifyRealtimeSync('message:new', { conversationId: convId, message: newMsg });
       return jsonResponse(201, { message: newMsg });
     }
   }
@@ -1427,17 +1336,17 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   const readMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/read$/);
   if (readMatch && method === 'POST') {
     const convId = readMatch[1];
-    let count = 0;
-    const now = new Date().toISOString();
+    const nowIso = new Date().toISOString();
+    let changed = false;
     for (const m of state.messages) {
       if (m.conversationId === convId && m.senderId !== currentUser.id && m.status !== 'read') {
         m.status = 'read';
-        m.readAt = now;
-        count++;
+        m.readAt = nowIso;
+        changed = true;
       }
     }
-    if (count > 0) await writeCloudState(state);
-    return jsonResponse(200, { updatedCount: count });
+    if (changed) writeLocalState(state);
+    return jsonResponse(200, { success: true });
   }
 
   const clearMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/clear$/);
@@ -1445,7 +1354,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     const conv = state.conversations.find((c) => c.id === clearMatch[1]);
     if (conv) {
       conv.clearedAt[currentUser.id] = new Date().toISOString();
-      await writeCloudState(state);
+      writeLocalState(state);
     }
     return jsonResponse(200, { success: true });
   }
@@ -1458,16 +1367,15 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       if (!conv.deletedBy.includes(currentUser.id)) {
         conv.deletedBy.push(currentUser.id);
       }
-      await writeCloudState(state);
+      writeLocalState(state);
     }
     return jsonResponse(200, { success: true });
   }
 
   const delMsgMatch = pathname.match(/^\/api\/messages\/([^/]+)$/);
   if (delMsgMatch && method === 'DELETE') {
-    const msgId = delMsgMatch[1];
+    const msg = state.messages.find((m) => m.id === delMsgMatch[1]);
     const mode = url.searchParams.get('mode') === 'everyone' ? 'everyone' : 'me';
-    const msg = state.messages.find((m) => m.id === msgId);
     if (msg) {
       if (mode === 'everyone' && msg.senderId === currentUser.id) {
         msg.deletedForEveryone = true;
@@ -1476,124 +1384,82 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       } else if (!msg.deletedFor.includes(currentUser.id)) {
         msg.deletedFor.push(currentUser.id);
       }
-      await writeCloudState(state);
+      writeLocalState(state);
     }
     return jsonResponse(200, { success: true });
   }
 
+  // Media
+  if (pathname === '/api/media' && method === 'POST') {
+    const { dataBase64, mimeType, conversationId, statusId } = bodyObj;
+    const now = new Date();
+    const rawStr = String(dataBase64 || '');
+    const media: StoredMedia = {
+      id: `med_${randomHex(8)}`,
+      ownerId: currentUser.id,
+      conversationId: conversationId ? String(conversationId) : undefined,
+      statusId: statusId ? String(statusId) : undefined,
+      mimeType: String(mimeType || 'image/jpeg'),
+      dataBase64: rawStr,
+      sizeBytes: Math.ceil((rawStr.length * 3) / 4),
+      createdAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + SEVEN_DAYS_MS).toISOString(),
+    };
+    state.media.push(media);
+    writeLocalState(state);
+    return jsonResponse(201, { mediaId: media.id, sizeBytes: media.sizeBytes });
+  }
+
+  const getMediaMatch = pathname.match(/^\/api\/media\/([^/]+)$/);
+  if (getMediaMatch && method === 'GET') {
+    const med = state.media.find((m) => m.id === getMediaMatch[1]);
+    if (!med) return jsonResponse(404, { error: 'Media not found.' });
+    return jsonResponse(200, med);
+  }
+
+  // Statuses
   if (pathname === '/api/statuses' && method === 'GET') {
-    const statuses: StatusItem[] = state.statuses
-      .filter((s) => {
-        if (s.userId === currentUser.id) return true;
-        const blocked = state.blocks.some(
-          (b) =>
-            (b.blockerId === currentUser.id && b.blockedUserId === s.userId) ||
-            (b.blockerId === s.userId && b.blockedUserId === currentUser.id)
-        );
-        if (blocked) return false;
-        const owner = state.users.find((u) => u.id === s.userId);
-        if (!owner) return false;
-        const effectivePrivacy =
-          s.privacy === 'contacts' || owner.privacy.statusPrivacy === 'contacts'
-            ? 'contacts'
-            : 'everyone';
-        if (effectivePrivacy === 'contacts') {
-          return state.contacts.some(
-            (c) =>
-              (c.userId === currentUser.id && c.contactUserId === s.userId) ||
-              (c.userId === s.userId && c.contactUserId === currentUser.id)
-          );
-        }
-        return true;
-      })
-      .map((s) => {
-        const owner = state.users.find((u) => u.id === s.userId);
-        return {
-          ...s,
-          user: owner ? toUserProfile(owner, currentUser.id, state) : null,
-          viewedByMe: s.viewers.some((v) => v.viewerId === currentUser.id),
-          viewCount: s.viewers.length,
-          viewers: s.viewers.map((v) => {
-            const vu = state.users.find((u) => u.id === v.viewerId);
-            return {
-              viewerId: v.viewerId,
-              fullName: vu?.fullName || 'User',
-              username: vu?.username || 'user',
-              avatarUrl: vu?.avatarUrl || '',
-              viewedAt: v.viewedAt,
-            };
-          }),
-        };
-      });
-    return jsonResponse(200, { statuses });
+    const list: StatusItem[] = state.statuses.map((s) => {
+      const owner = state.users.find((u) => u.id === s.userId);
+      const viewedByMe = s.viewers.some((v) => v.viewerId === currentUser.id);
+      return {
+        id: s.id,
+        userId: s.userId,
+        type: s.type,
+        text: s.text,
+        backgroundColor: s.backgroundColor,
+        textColor: s.textColor,
+        imageId: s.imageId,
+        privacy: s.privacy,
+        createdAt: s.createdAt,
+        expiresAt: s.expiresAt,
+        user: owner ? toUserProfile(owner, currentUser.id, state) : null,
+        viewedByMe,
+        viewCount: s.userId === currentUser.id ? s.viewers.length : undefined,
+      };
+    });
+    return jsonResponse(200, { statuses: list });
   }
 
   if (pathname === '/api/statuses' && method === 'POST') {
     const { type, text, backgroundColor, textColor, imageId, privacy } = bodyObj;
     const now = new Date();
-    const st: StoredStatus = {
+    const newStatus: StoredStatus = {
       id: `sts_${randomHex(8)}`,
       userId: currentUser.id,
-      type,
+      type: type === 'image' ? 'image' : 'text',
       text: String(text || '').trim(),
-      backgroundColor: backgroundColor || '#F2F2F7',
-      textColor: textColor || '#1C1C1E',
-      imageId,
-      privacy: privacy || 'everyone',
+      backgroundColor: String(backgroundColor || '#F2F2F7'),
+      textColor: String(textColor || '#1C1C1E'),
+      imageId: imageId ? String(imageId) : undefined,
+      privacy: privacy === 'contacts' ? 'contacts' : 'everyone',
       createdAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
       viewers: [],
     };
-    state.statuses.push(st);
-    await writeCloudState(state);
-    return jsonResponse(201, { status: st });
-  }
-
-  const viewStatusMatch = pathname.match(/^\/api\/statuses\/([^/]+)\/view$/);
-  if (viewStatusMatch && method === 'POST') {
-    const st = state.statuses.find((s) => s.id === viewStatusMatch[1]);
-    if (st && st.userId !== currentUser.id) {
-      if (!st.viewers.some((v) => v.viewerId === currentUser.id)) {
-        st.viewers.push({ viewerId: currentUser.id, viewedAt: new Date().toISOString() });
-        await writeCloudState(state);
-      }
-    }
-    return jsonResponse(200, { success: true });
-  }
-
-  const delStatusMatch = pathname.match(/^\/api\/statuses\/([^/]+)$/);
-  if (delStatusMatch && method === 'DELETE') {
-    state.statuses = state.statuses.filter(
-      (s) => !(s.id === delStatusMatch[1] && s.userId === currentUser.id)
-    );
-    await writeCloudState(state);
-    return jsonResponse(200, { success: true });
-  }
-
-  if (pathname === '/api/media' && method === 'POST') {
-    const { dataBase64, mimeType, conversationId, statusId } = bodyObj;
-    const now = new Date();
-    const med: StoredMedia = {
-      id: `med_${randomHex(8)}`,
-      ownerId: currentUser.id,
-      conversationId,
-      statusId,
-      mimeType: mimeType || 'image/jpeg',
-      dataBase64,
-      sizeBytes: Math.ceil((String(dataBase64).length * 3) / 4),
-      createdAt: now.toISOString(),
-      expiresAt: new Date(now.getTime() + SEVEN_DAYS_MS).toISOString(),
-    };
-    state.media.push(med);
-    await writeCloudState(state);
-    return jsonResponse(201, { mediaId: med.id, sizeBytes: med.sizeBytes });
-  }
-
-  const mediaGetMatch = pathname.match(/^\/api\/media\/([^/]+)$/);
-  if (mediaGetMatch && method === 'GET') {
-    const med = state.media.find((m) => m.id === mediaGetMatch[1]);
-    if (!med) return jsonResponse(404, { error: 'Media not found.' });
-    return jsonResponse(200, med);
+    state.statuses.push(newStatus);
+    writeLocalState(state);
+    return jsonResponse(201, { status: newStatus });
   }
 
   if (pathname === '/api/storage/stats' && method === 'GET') {
@@ -1602,16 +1468,23 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
         .filter((c) => c.participantIds.includes(currentUser.id))
         .map((c) => c.id)
     );
-    const messageCount = state.messages.filter((m) => myConvIds.has(m.conversationId)).length;
-    const mediaItems = state.media.filter((m) => m.ownerId === currentUser.id);
     return jsonResponse(200, {
       conversationsCount: myConvIds.size,
-      messageCount,
-      mediaCount: mediaItems.length,
-      totalMediaBytes: mediaItems.reduce((sum, item) => sum + item.sizeBytes, 0),
+      messageCount: state.messages.filter((m) => myConvIds.has(m.conversationId)).length,
+      mediaCount: state.media.filter((m) => m.ownerId === currentUser.id).length,
+      totalMediaBytes: state.media
+        .filter((m) => m.ownerId === currentUser.id)
+        .reduce((acc, m) => acc + m.sizeBytes, 0),
       retentionDays: 7,
     });
   }
 
-  return jsonResponse(200, { success: true });
+  if (pathname === '/api/users/account' && method === 'DELETE') {
+    state.users = state.users.filter((u) => u.id !== currentUser.id);
+    delete state.sessions[token];
+    writeLocalState(state);
+    return jsonResponse(200, { success: true });
+  }
+
+  return jsonResponse(200, { ok: true });
 }
