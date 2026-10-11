@@ -392,6 +392,13 @@ export function installServerlessFallbackInterceptor() {
       const response = await originalFetch(input, init);
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
+        // If backend returned 401 on a cold serverless instance, verify against Firebase cloud fallback before failing
+        if (response.status === 401 && !urlStr.startsWith('/api/auth/login') && !urlStr.startsWith('/api/auth/recover')) {
+          const fallbackRes = await handleFallbackApiRequest(urlStr, init);
+          if (fallbackRes.ok) {
+            return fallbackRes;
+          }
+        }
         // If this was a user search that returned null on the backend, also check client cloud state as a safety net
         if (urlStr.startsWith('/api/users/search') && response.ok) {
           const clone = response.clone();
@@ -440,8 +447,29 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
 
   const state = await readCloudState();
-  const currentUserId = token ? state.sessions[token] : undefined;
-  const currentUser = currentUserId ? state.users.find((u) => u.id === currentUserId) : undefined;
+  let currentUserId = token ? state.sessions[token] : undefined;
+  if (!currentUserId && token.startsWith('lmv.')) {
+    const parts = token.split('.');
+    if (parts.length >= 3) {
+      currentUserId = parts[1];
+    }
+  }
+  let currentUser = currentUserId ? state.users.find((u) => u.id === currentUserId) : undefined;
+  if (!currentUser && token) {
+    try {
+      const cachedRaw = localStorage.getItem('lamavi_current_user');
+      if (cachedRaw) {
+        const cachedUser = JSON.parse(cachedRaw) as UserProfile;
+        if (cachedUser && cachedUser.id) {
+          currentUser = state.users.find(
+            (u) => u.id === cachedUser.id || u.username.toLowerCase() === cachedUser.username.toLowerCase()
+          );
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
 
   // 1. Register
   if (pathname === '/api/auth/register' && method === 'POST') {
@@ -505,7 +533,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       chatSettings: { enterToSend: true, fontSize: 'medium', autoDownloadImages: true },
     };
 
-    const newToken = randomHex(24);
+    const newToken = `lmv.${newUser.id}.${randomHex(24)}`;
     state.users.push(newUser);
     state.sessions[newToken] = newUser.id;
     await writeCloudState(state);
@@ -530,7 +558,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     }
     user.lastSeen = new Date().toISOString();
     user.isOnline = true;
-    const newToken = randomHex(24);
+    const newToken = `lmv.${user.id}.${randomHex(24)}`;
     state.sessions[newToken] = user.id;
     await writeCloudState(state);
     return jsonResponse(200, {

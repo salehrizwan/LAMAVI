@@ -80,6 +80,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [selectedMsgMenu, setSelectedMsgMenu] = useState<MessageItem | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showHeaderMenu, setShowHeaderMenu] = useState(false);
+  const [showContactInfoModal, setShowContactInfoModal] = useState(false);
+  const [copiedUsername, setCopiedUsername] = useState(false);
   const [confirmClearModal, setConfirmClearModal] = useState(false);
   const [confirmDeleteConvModal, setConfirmDeleteConvModal] = useState(false);
 
@@ -111,6 +113,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     setReplyTo(null);
     setSelectedMsgMenu(null);
     setShowEmojiPicker(false);
+    setShowContactInfoModal(false);
   }, [conversation.id, draftStorageKey]);
 
   const handleInputChange = (val: string) => {
@@ -212,6 +215,12 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
   const recipient = conversation.recipient;
 
+  const handleCopyUsername = () => {
+    navigator.clipboard.writeText(`@${recipient.username}`);
+    setCopiedUsername(true);
+    setTimeout(() => setCopiedUsername(false), 1800);
+  };
+
   const renderDeliveryIcon = (msg: MessageItem) => {
     if (msg.senderId !== currentUser.id) return null;
     if (msg.status === 'pending' || msg.status === 'sending') {
@@ -256,25 +265,48 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     <div className="flex flex-col h-full w-full bg-[#F8F9FA] relative">
       {/* Sticky iOS Chat Top Header */}
       <header className="h-15 px-3 sm:px-5 bg-white/90 backdrop-blur-md border-b border-[#E5E5EA] flex items-center justify-between shrink-0 z-20">
-        <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex items-center gap-2.5 min-w-0 flex-1">
           <button
             type="button"
             onClick={onBack}
-            className="lg:hidden min-h-[44px] min-w-[44px] -ml-2 flex items-center justify-center text-[#1C1C1E] hover:bg-[#F2F2F7] rounded-full transition-colors"
+            className="lg:hidden min-h-[44px] min-w-[44px] -ml-2 flex items-center justify-center text-[#1C1C1E] hover:bg-[#F2F2F7] rounded-full transition-colors shrink-0"
             aria-label="Back to chats"
           >
             <ChevronLeft className="w-5 h-5" />
           </button>
 
-          <Avatar
-            src={recipient.avatarUrl}
-            name={recipient.fullName}
-            size="md"
-            isOnline={recipient.isOnline}
-            showPresence
-          />
+          {/* Clicking the DP directly opens full-screen DP viewer (or Contact Info if no photo) */}
+          <button
+            type="button"
+            onClick={() => {
+              if (recipient.avatarUrl) {
+                setFullScreenImage({
+                  src: recipient.avatarUrl,
+                  caption: `${recipient.fullName} (@${recipient.username})`,
+                });
+              } else {
+                setShowContactInfoModal(true);
+              }
+            }}
+            className="shrink-0 rounded-full focus:outline-none cursor-pointer transition-transform active:scale-95"
+            title="Tap to view profile picture"
+          >
+            <Avatar
+              src={recipient.avatarUrl}
+              name={recipient.fullName}
+              size="md"
+              isOnline={recipient.isOnline}
+              showPresence
+            />
+          </button>
 
-          <div className="min-w-0">
+          {/* Clicking the header bar / name / status opens WhatsApp-style Contact Info sheet */}
+          <button
+            type="button"
+            onClick={() => setShowContactInfoModal(true)}
+            className="min-w-0 flex-1 text-left py-1 px-1.5 rounded-xl hover:bg-[#F2F2F7]/70 transition-colors cursor-pointer"
+            title="Tap here for contact info"
+          >
             <div className="flex items-center gap-1.5">
               <h2 className="font-display text-sm sm:text-base font-semibold text-[#1C1C1E] truncate">
                 {recipient.fullName}
@@ -285,15 +317,15 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               {isRecipientTyping
                 ? 'typing...'
                 : recipient.isOnline
-                ? 'Online'
+                ? 'Online · tap for contact info'
                 : recipient.lastSeen
-                ? `Last seen ${formatRelativeTime(recipient.lastSeen)}`
-                : 'Offline'}
+                ? `Last seen ${formatRelativeTime(recipient.lastSeen)} · tap for info`
+                : 'Tap here for contact info'}
             </p>
-          </div>
+          </button>
         </div>
 
-        <div className="relative">
+        <div className="relative shrink-0">
           <button
             type="button"
             onClick={() => setShowHeaderMenu(!showHeaderMenu)}
@@ -306,7 +338,29 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           {showHeaderMenu && (
             <>
               <div className="fixed inset-0 z-20" onClick={() => setShowHeaderMenu(false)} />
-              <div className="absolute right-0 mt-1 w-52 rounded-2xl bg-white border border-[#E5E5EA] shadow-lg py-1.5 z-30">
+              <div className="absolute right-0 mt-1 w-56 rounded-2xl bg-white border border-[#E5E5EA] shadow-lg py-1.5 z-30">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowHeaderMenu(false);
+                    setShowContactInfoModal(true);
+                  }}
+                  className="w-full px-4 py-2.5 text-left text-xs font-medium text-[#1C1C1E] hover:bg-[#F8F9FA] flex items-center gap-2.5"
+                >
+                  <ImageIcon className="w-4 h-4 text-[#636366]" />
+                  <span>View Contact Profile & Bio</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleCopyUsername();
+                    setShowHeaderMenu(false);
+                  }}
+                  className="w-full px-4 py-2.5 text-left text-xs font-medium text-[#1C1C1E] hover:bg-[#F8F9FA] flex items-center gap-2.5"
+                >
+                  <Copy className="w-4 h-4 text-[#636366]" />
+                  <span>Copy Username (@{recipient.username})</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => {
@@ -753,6 +807,169 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               >
                 Delete
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* WhatsApp / iOS Style Contact Info Modal (DP, Name, Bio, Copy Username, Block) */}
+      {showContactInfoModal && (
+        <div className="fixed inset-0 z-50 bg-black/45 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-3xl bg-white border border-[#E5E5EA] shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-[#E5E5EA]">
+              <h3 className="font-display text-base font-semibold text-[#1C1C1E]">Contact Info</h3>
+              <button
+                type="button"
+                onClick={() => setShowContactInfoModal(false)}
+                className="w-9 h-9 rounded-full hover:bg-[#F2F2F7] flex items-center justify-center text-[#636366]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 bg-[#F8F9FA] flex flex-col items-center text-center border-b border-[#E5E5EA]">
+              {/* iOS Notes-style thought bubble for Bio above DP */}
+              <div className="relative mb-3 max-w-[260px]">
+                <div className="px-4 py-2 rounded-2xl bg-white border border-[#E5E5EA] shadow-2xs text-xs text-[#1C1C1E] leading-snug">
+                  {recipient.bio ? recipient.bio : 'No bio added yet'}
+                </div>
+                <div className="w-3 h-3 rounded-full bg-white border-r border-b border-[#E5E5EA] mx-auto -mt-1.5 rotate-45" />
+                <div className="w-1.5 h-1.5 rounded-full bg-white border border-[#E5E5EA] mx-auto mt-0.5" />
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (recipient.avatarUrl) {
+                    setFullScreenImage({
+                      src: recipient.avatarUrl,
+                      caption: `${recipient.fullName} (@${recipient.username})`,
+                    });
+                  }
+                }}
+                className={`rounded-full focus:outline-none ${
+                  recipient.avatarUrl ? 'cursor-pointer hover:opacity-90 transition-opacity' : ''
+                }`}
+                title={recipient.avatarUrl ? 'Tap to view full-screen DP' : undefined}
+              >
+                <Avatar
+                  src={recipient.avatarUrl}
+                  name={recipient.fullName}
+                  size="2xl"
+                  isOnline={recipient.isOnline}
+                  showPresence
+                />
+              </button>
+              {recipient.avatarUrl && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setFullScreenImage({
+                      src: recipient.avatarUrl,
+                      caption: `${recipient.fullName} (@${recipient.username})`,
+                    })
+                  }
+                  className="mt-2 text-[11px] font-medium text-[#636366] hover:text-[#1C1C1E] underline"
+                >
+                  Tap to view full-size DP
+                </button>
+              )}
+
+              <h4 className="font-display text-lg font-bold text-[#1C1C1E] mt-3">
+                {recipient.fullName}
+              </h4>
+              <p className="text-xs text-[#636366] mt-0.5">@{recipient.username}</p>
+              <p className="text-[11px] text-[#8E8E93] mt-1">
+                {recipient.isOnline
+                  ? 'Online now'
+                  : recipient.lastSeen
+                  ? `Last seen ${formatRelativeTime(recipient.lastSeen)}`
+                  : 'Offline'}
+              </p>
+            </div>
+
+            <div className="p-5 space-y-3 bg-white">
+              {/* Bio Section Card */}
+              <div className="p-3.5 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA]">
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-[#8E8E93]">
+                  About / Bio
+                </div>
+                <p className="text-sm text-[#1C1C1E] mt-1 leading-relaxed">
+                  {recipient.bio ? recipient.bio : 'No bio added yet.'}
+                </p>
+              </div>
+
+              {/* Copy Username to Share */}
+              <div className="p-3.5 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA] flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#8E8E93]">
+                    Username
+                  </div>
+                  <div className="text-sm font-medium text-[#1C1C1E] truncate mt-0.5">
+                    @{recipient.username}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopyUsername}
+                  className="h-9 px-3.5 rounded-xl bg-white hover:bg-[#F2F2F7] border border-[#D1D1D6] text-xs font-semibold text-[#1C1C1E] flex items-center gap-1.5 shrink-0 transition-colors"
+                >
+                  {copiedUsername ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-[#15803D]" />
+                      <span className="text-[#15803D]">Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Username</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Action Buttons: Block User & Clear/Delete */}
+              <div className="pt-1 flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await onToggleBlockUser(recipient.id, conversation.blockedByMe);
+                  }}
+                  className="w-full h-11 rounded-xl bg-[#FEF2F2] hover:bg-[#FEE2E2] border border-[#FECACA] text-xs font-semibold text-[#B91C1C] flex items-center justify-center gap-2 transition-colors"
+                >
+                  <ShieldBan className="w-4 h-4" />
+                  <span>
+                    {conversation.blockedByMe
+                      ? `Unblock ${recipient.fullName}`
+                      : `Block ${recipient.fullName}`}
+                  </span>
+                </button>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowContactInfoModal(false);
+                      setConfirmClearModal(true);
+                    }}
+                    className="h-10 rounded-xl bg-[#F8F9FA] hover:bg-[#F2F2F7] border border-[#E5E5EA] text-xs font-medium text-[#1C1C1E] flex items-center justify-center gap-1.5"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5 text-[#636366]" />
+                    <span>Clear Chat</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowContactInfoModal(false);
+                      setConfirmDeleteConvModal(true);
+                    }}
+                    className="h-10 rounded-xl bg-[#F8F9FA] hover:bg-[#FEF2F2] border border-[#E5E5EA] text-xs font-medium text-[#B91C1C] flex items-center justify-center gap-1.5"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Delete Chat</span>
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

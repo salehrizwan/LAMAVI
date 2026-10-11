@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Search, X, MessageSquare, UserPlus, Check, AlertCircle, WifiOff } from 'lucide-react';
 import { UserProfile } from '../types';
 import { Avatar } from './Avatar';
+import { FullScreenImageViewer } from './SecureImage';
 import { formatRelativeTime } from '../utils/media';
 
 interface UserSearchModalProps {
@@ -25,6 +26,7 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
   const [result, setResult] = useState<UserProfile | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [addedContact, setAddedContact] = useState(false);
+  const [fullScreenDp, setFullScreenDp] = useState<{ src: string; caption?: string } | null>(null);
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -134,13 +136,29 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
                 <div className="w-1.5 h-1.5 rounded-full bg-white border border-[#E5E5EA] mx-auto mt-0.5" />
               </div>
 
-              <Avatar
-                src={result.avatarUrl}
-                name={result.fullName}
-                size="xl"
-                isOnline={result.isOnline}
-                showPresence
-              />
+              <button
+                type="button"
+                onClick={() => {
+                  if (result.avatarUrl) {
+                    setFullScreenDp({
+                      src: result.avatarUrl,
+                      caption: `${result.fullName} (@${result.username})`,
+                    });
+                  }
+                }}
+                className={`rounded-full focus:outline-none ${
+                  result.avatarUrl ? 'cursor-pointer hover:opacity-90' : ''
+                }`}
+                title={result.avatarUrl ? 'Tap to view DP' : undefined}
+              >
+                <Avatar
+                  src={result.avatarUrl}
+                  name={result.fullName}
+                  size="xl"
+                  isOnline={result.isOnline}
+                  showPresence
+                />
+              </button>
 
               <h4 className="font-display text-base font-bold text-[#1C1C1E] mt-3">
                 {result.fullName}
@@ -190,6 +208,14 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
           )}
         </div>
       </div>
+
+      {fullScreenDp && (
+        <FullScreenImageViewer
+          src={fullScreenDp.src}
+          caption={fullScreenDp.caption}
+          onClose={() => setFullScreenDp(null)}
+        />
+      )}
     </div>
   );
 };

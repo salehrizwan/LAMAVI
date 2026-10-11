@@ -128,19 +128,23 @@ export default function App() {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then(async (res) => {
-        if (res.status === 401) {
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.user) {
+            setCurrentUser(data.user);
+            localStorage.setItem('lamavi_current_user', JSON.stringify(data.user));
+          }
+          return;
+        }
+        // Only clear session if there is no cached user profile on this device
+        const cachedRaw = localStorage.getItem('lamavi_current_user');
+        if (res.status === 401 && !cachedRaw) {
           localStorage.removeItem('lamavi_auth_token');
           localStorage.removeItem('lamavi_current_user');
           localStorage.removeItem('nacre_auth_token');
           localStorage.removeItem('nacre_current_user');
           setToken(null);
           setCurrentUser(null);
-          return;
-        }
-        if (res.ok) {
-          const data = await res.json();
-          setCurrentUser(data.user);
-          localStorage.setItem('lamavi_current_user', JSON.stringify(data.user));
         }
       })
       .catch(() => {})

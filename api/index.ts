@@ -292,14 +292,28 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
   for (const s of base.sessions || []) {
     sessionMap.set(s.token, s);
   }
+  const incomingWithMap = incoming as Partial<DatabaseSchema> & {
+    sessionsMap?: Record<string, string>;
+  };
   if (Array.isArray(incoming.sessions)) {
     for (const s of incoming.sessions) {
-      sessionMap.set(s.token, s);
+      if (s && s.token && s.userId) {
+        sessionMap.set(s.token, s);
+      }
     }
   } else if (incoming.sessions && typeof incoming.sessions === 'object') {
     const now = new Date().toISOString();
     const exp = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     for (const [tok, uid] of Object.entries(incoming.sessions as Record<string, string>)) {
+      if (!sessionMap.has(tok)) {
+        sessionMap.set(tok, { token: tok, userId: String(uid), createdAt: now, expiresAt: exp });
+      }
+    }
+  }
+  if (incomingWithMap.sessionsMap && typeof incomingWithMap.sessionsMap === 'object') {
+    const now = new Date().toISOString();
+    const exp = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    for (const [tok, uid] of Object.entries(incomingWithMap.sessionsMap)) {
       if (!sessionMap.has(tok)) {
         sessionMap.set(tok, { token: tok, userId: String(uid), createdAt: now, expiresAt: exp });
       }
@@ -377,7 +391,7 @@ export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
   }
 }
 
-export function saveDatabase(data: DatabaseSchema = db) {
+export async function saveDatabase(data: DatabaseSchema = db): Promise<void> {
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -389,7 +403,7 @@ export function saveDatabase(data: DatabaseSchema = db) {
     // Ignore read-only filesystem errors on serverless
   }
 
-  // Persist asynchronously to Firebase Firestore `/lamavi_public/app_state` so all devices see updates immediately
+  // Persist to Firebase Firestore `/lamavi_public/app_state` so all devices & serverless instances see updates immediately
   try {
     const sessionsMap: Record<string, string> = {};
     for (const s of data.sessions) {
@@ -402,7 +416,7 @@ export function saveDatabase(data: DatabaseSchema = db) {
     };
     const serialized = JSON.stringify(lightCopy);
     if (serialized.length < 950000) {
-      fetch(FIRESTORE_DOC_URL, {
+      await fetch(FIRESTORE_DOC_URL, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -621,7 +635,30 @@ export function createApiApp(
     next();
   });
 
-  function getAuthenticatedUser(req: express.Request): UserRecord | null {
+  function resolveUserFromToken(token: string): UserRecord | null {
+    if (!token) return null;
+    const now = new Date().toISOString();
+    const session = db.sessions.find(
+      (s) => s.token === token && (!s.expiresAt || s.expiresAt > now)
+    );
+    if (session) {
+      const found = db.users.find((u) => u.id === session.userId);
+      if (found) return found;
+    }
+
+    // Stateless token format `lmv.<userId>.<randomHex>` so serverless cold starts never drop a session
+    if (token.startsWith('lmv.')) {
+      const parts = token.split('.');
+      if (parts.length >= 3) {
+        const uid = parts[1];
+        const found = db.users.find((u) => u.id === uid);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  async function getAuthenticatedUserAsync(req: express.Request): Promise<UserRecord | null> {
     const authHeader = req.headers.authorization;
     const tokenFromQuery =
       typeof req.query.token === 'string' ? req.query.token : undefined;
@@ -630,21 +667,21 @@ export function createApiApp(
       : tokenFromQuery;
     if (!token) return null;
 
-    const now = new Date().toISOString();
-    const session = db.sessions.find(
-      (s) => s.token === token && s.expiresAt > now
-    );
-    if (!session) return null;
-
-    return db.users.find((u) => u.id === session.userId) || null;
+    let user = resolveUserFromToken(token);
+    if (!user) {
+      // Force reload from Firestore in case account/session was just created on another serverless instance
+      await ensureCloudDatabaseLoaded(true);
+      user = resolveUserFromToken(token);
+    }
+    return user;
   }
 
-  function requireAuth(
+  async function requireAuth(
     req: express.Request,
     res: express.Response,
     next: express.NextFunction
   ) {
-    const user = getAuthenticatedUser(req);
+    const user = await getAuthenticatedUserAsync(req);
     if (!user) {
       res
         .status(401)
@@ -656,7 +693,8 @@ export function createApiApp(
   }
 
   // --- AUTHENTICATION ROUTES ---
-  app.post('/api/auth/register', (req, res) => {
+  app.post('/api/auth/register', async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const { fullName, username, email, password } = req.body || {};
 
     if (
@@ -754,7 +792,7 @@ export function createApiApp(
 
     db.users.push(newUser);
 
-    const token = crypto.randomBytes(32).toString('hex');
+    const token = `lmv.${newUser.id}.${crypto.randomBytes(24).toString('hex')}`;
     const expiresAt = new Date(
       Date.now() + 1000 * 60 * 60 * 24 * 30
     ).toISOString();
@@ -765,7 +803,7 @@ export function createApiApp(
       expiresAt,
     });
 
-    saveDatabase();
+    await saveDatabase();
 
     res.status(201).json({
       token,
@@ -774,7 +812,8 @@ export function createApiApp(
     });
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const { identifier, password } = req.body || {};
     if (
       !identifier ||
@@ -808,7 +847,7 @@ export function createApiApp(
     const now = new Date().toISOString();
     user.lastSeen = now;
     user.isOnline = true;
-    const token = crypto.randomBytes(32).toString('hex');
+    const token = `lmv.${user.id}.${crypto.randomBytes(24).toString('hex')}`;
     const expiresAt = new Date(
       Date.now() + 1000 * 60 * 60 * 24 * 30
     ).toISOString();
@@ -819,7 +858,7 @@ export function createApiApp(
       createdAt: now,
       expiresAt,
     });
-    saveDatabase();
+    await saveDatabase();
 
     res.json({
       token,
