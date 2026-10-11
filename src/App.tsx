@@ -138,6 +138,15 @@ export default function App() {
             setCurrentUser(data.user);
             localStorage.setItem('lamavi_current_user', JSON.stringify(data.user));
           }
+        } else if (res.status === 401) {
+          // Session was invalidated or account was reset — clear stale cached session so user can log in or sign up fresh
+          localStorage.removeItem('lamavi_auth_token');
+          localStorage.removeItem('lamavi_current_user');
+          localStorage.removeItem('nacre_auth_token');
+          localStorage.removeItem('nacre_current_user');
+          setToken(null);
+          setCurrentUser(null);
+          setSelectedConvId(null);
         }
       })
       .catch(() => {})
@@ -154,6 +163,15 @@ export default function App() {
         fetch('/api/statuses', { headers: { Authorization: `Bearer ${token}` } }),
         fetch('/api/contacts', { headers: { Authorization: `Bearer ${token}` } }),
       ]);
+
+      if (convRes.status === 401) {
+        localStorage.removeItem('lamavi_auth_token');
+        localStorage.removeItem('lamavi_current_user');
+        setToken(null);
+        setCurrentUser(null);
+        setSelectedConvId(null);
+        return;
+      }
 
       if (convRes.ok) {
         const convData = await convRes.json();
@@ -270,17 +288,15 @@ export default function App() {
     };
   }, [token, currentUser?.id, selectedConvId, fetchAllData, fetchConversationMessages]);
 
-  // Periodic sync fallback for serverless hosts (e.g. Vercel) where persistent WebSockets may not stay open
+  // Real-time background synchronization every 2.5 seconds so messages and read receipts appear across devices/tabs automatically without manual refresh
   useEffect(() => {
     if (!token || !currentUser || !isOnline) return;
     const interval = setInterval(() => {
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        fetchAllData();
-        if (selectedConvId) {
-          fetchConversationMessages(selectedConvId);
-        }
+      fetchAllData();
+      if (selectedConvId) {
+        fetchConversationMessages(selectedConvId);
       }
-    }, 3000);
+    }, 2500);
     return () => clearInterval(interval);
   }, [token, currentUser?.id, isOnline, selectedConvId, fetchAllData, fetchConversationMessages]);
 
@@ -497,7 +513,7 @@ export default function App() {
       retryTempId?: string;
     }
   ) => {
-    if (!currentUser || !token || !isOnline) return;
+    if (!currentUser || !token) return;
 
     const activeConvObj = conversations.find((c) => c.id === conversationId);
     const recipientId = activeConvObj?.recipient?.id;
@@ -505,6 +521,46 @@ export default function App() {
     const clientTempId =
       options?.retryTempId || `temp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
+
+    if (!isOnline) {
+      const pendingMsg: MessageItem = {
+        id: clientTempId,
+        clientTempId,
+        conversationId,
+        senderId: currentUser.id,
+        recipientId,
+        text,
+        localImageDataUrl: options?.imageDataBase64,
+        replyToMessageId: options?.replyToMessageId,
+        createdAt: now,
+        status: 'pending',
+      };
+      setMessagesByConv((prev) => {
+        const list = (prev[conversationId] || []).filter((m) => m.clientTempId !== clientTempId);
+        const next = { ...prev, [conversationId]: [...list, pendingMsg] };
+        saveCache(currentUser.id, 'msgs', next);
+        return next;
+      });
+      setOutgoingQueue((prev) => {
+        const filtered = prev.filter((q) => q.clientTempId !== clientTempId);
+        const next: OutgoingQueueItem[] = [
+          ...filtered,
+          {
+            clientTempId,
+            conversationId,
+            text,
+            imageDataBase64: options?.imageDataBase64,
+            imageMimeType: options?.imageMimeType,
+            replyToMessageId: options?.replyToMessageId,
+            createdAt: now,
+            status: 'pending',
+          },
+        ];
+        saveCache(currentUser.id, 'queue', next);
+        return next;
+      });
+      return;
+    }
 
     const optimisticMsg: MessageItem = {
       id: clientTempId,

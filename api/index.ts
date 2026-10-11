@@ -249,6 +249,9 @@ function cleanParsedDatabase(parsed: DatabaseSchema): DatabaseSchema {
 import seedDatabaseRaw from '../data/seed_database.json';
 
 function loadLocalDatabase(): DatabaseSchema {
+  if (getActiveDbProvider() === 'supabase') {
+    return createEmptyDb();
+  }
   let baseDb = cleanParsedDatabase(
     JSON.parse(JSON.stringify(seedDatabaseRaw)) as DatabaseSchema
   );
@@ -538,27 +541,22 @@ export async function ensureCloudDatabaseLoaded(_force = false): Promise<void> {
   if (getActiveDbProvider() === 'supabase') {
     const remoteDb = await loadDatabaseFromSupabase();
     if (remoteDb) {
-      const hasRemoteUsers = Array.isArray(remoteDb.users) && remoteDb.users.length > 0;
-      if (hasRemoteUsers) {
-        // Supabase is authoritative: remote records take precedence over stale local cache
-        db = cleanParsedDatabase({
-          users: remoteDb.users || [],
-          sessions: remoteDb.sessions || [],
-          conversations: remoteDb.conversations || [],
-          messages: remoteDb.messages || [],
-          media: remoteDb.media && remoteDb.media.length > 0 ? remoteDb.media : db.media,
-          statuses: remoteDb.statuses || [],
-          statusViews: remoteDb.statusViews || [],
-          blocks: remoteDb.blocks || [],
-          reports: remoteDb.reports || [],
-          contacts: remoteDb.contacts || [],
-        });
-      } else {
-        // Initial bootstrap if remote tables are completely empty
-        db = mergeDatabases(db, remoteDb);
-      }
-      return;
+      // Supabase is strictly authoritative (including when empty after a fresh reset)
+      // Normalize conversations and messages through mergeDatabases against an empty base so deterministic conversation IDs are enforced
+      db = mergeDatabases(createEmptyDb(), {
+        users: remoteDb.users || [],
+        sessions: remoteDb.sessions || [],
+        conversations: remoteDb.conversations || [],
+        messages: remoteDb.messages || [],
+        media: remoteDb.media || [],
+        statuses: remoteDb.statuses || [],
+        statusViews: remoteDb.statusViews || [],
+        blocks: remoteDb.blocks || [],
+        reports: remoteDb.reports || [],
+        contacts: remoteDb.contacts || [],
+      });
     }
+    return;
   }
 
   try {
@@ -621,18 +619,16 @@ function hashSecret(
 function verifySecret(
   secret: string,
   salt: string,
-  expectedHash: string
+  expectedHash: string,
+  allowCaseInsensitive = false
 ): boolean {
   if (!expectedHash || typeof secret !== 'string') return false;
-  const candidates = [
-    secret,
-    secret.trim(),
-    secret.trim().toLowerCase(),
-    secret.trim().toUpperCase(),
-  ];
+  const candidates = allowCaseInsensitive
+    ? [secret, secret.trim(), secret.trim().toUpperCase(), secret.trim().toLowerCase()]
+    : [secret];
 
   for (const candidate of candidates) {
-    // 1. Check SHA-256 hex digest (used by client fallback & new unified accounts)
+    // 1. Check SHA-256 hex digest
     const sha = crypto.createHash('sha256').update(candidate).digest('hex');
     if (sha === expectedHash) return true;
 
@@ -823,16 +819,6 @@ export function createApiApp(
       const found = db.users.find((u) => u.id === session.userId);
       if (found) return found;
     }
-
-    // Stateless token format `lmv.<userId>.<randomHex>` so serverless cold starts never drop a session
-    if (token.startsWith('lmv.')) {
-      const parts = token.split('.');
-      if (parts.length >= 3) {
-        const uid = parts[1];
-        const found = db.users.find((u) => u.id === uid);
-        if (found) return found;
-      }
-    }
     return null;
   }
 
@@ -847,73 +833,9 @@ export function createApiApp(
 
     let user = resolveUserFromToken(token);
     if (!user) {
-      // Force reload from Supabase in case account/session was just created on another serverless instance
+      // Reload from Supabase in case account/session was just created
       await ensureCloudDatabaseLoaded(true);
       user = resolveUserFromToken(token);
-    }
-
-    // If still not found, check if client passed their authenticated user profile header so cold serverless instances can recover seamlessly
-    if (!user) {
-      const fallbackUserHeader = req.headers['x-lamavi-user'];
-      if (typeof fallbackUserHeader === 'string' && fallbackUserHeader.trim()) {
-        try {
-          const parsedUser = JSON.parse(fallbackUserHeader) as Partial<UserRecord>;
-          if (parsedUser && parsedUser.id && parsedUser.username) {
-            user = db.users.find(
-              (u) =>
-                u.id === parsedUser.id ||
-                u.username.toLowerCase() === String(parsedUser.username).toLowerCase()
-            ) || null;
-            if (!user) {
-              const now = new Date().toISOString();
-              const recoveredUser: UserRecord = {
-                id: parsedUser.id,
-                fullName: parsedUser.fullName || parsedUser.username,
-                username: String(parsedUser.username).toLowerCase(),
-                email: String(parsedUser.email || '').toLowerCase(),
-                passwordSalt: 'sha256_client',
-                passwordHash: '',
-                recoveryCodeSalt: 'sha256_client',
-                recoveryCodeHash: '',
-                bio: parsedUser.bio || '',
-                avatarUrl: parsedUser.avatarUrl || '',
-                createdAt: parsedUser.createdAt || now,
-                lastSeen: now,
-                isOnline: true,
-                usernameChangeTimestamps: [],
-                privacy: parsedUser.privacy || {
-                  profilePicVisibility: 'everyone',
-                  lastSeenVisibility: 'everyone',
-                  readReceipts: true,
-                  statusPrivacy: 'everyone',
-                  whoCanContact: 'everyone',
-                },
-                notifications: parsedUser.notifications || {
-                  messageAlerts: true,
-                  soundEnabled: true,
-                  previewText: true,
-                },
-                chatSettings: parsedUser.chatSettings || {
-                  enterToSend: true,
-                  fontSize: 'medium',
-                  autoDownloadImages: true,
-                },
-              };
-              db.users.push(recoveredUser);
-              db.sessions.push({
-                token,
-                userId: recoveredUser.id,
-                createdAt: now,
-                expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-              });
-              await saveDatabase();
-              user = recoveredUser;
-            }
-          }
-        } catch {
-          // ignore invalid header
-        }
-      }
     }
 
     return user;
@@ -1162,7 +1084,8 @@ export function createApiApp(
       !verifySecret(
         String(recoveryCode).trim().toUpperCase(),
         user.recoveryCodeSalt,
-        user.recoveryCodeHash
+        user.recoveryCodeHash,
+        true
       )
     ) {
       res
@@ -1525,53 +1448,16 @@ export function createApiApp(
   });
 
   app.post('/api/contacts/add', requireAuth, async (req, res) => {
-    await ensureCloudDatabaseLoaded();
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
-    const { targetUserId, targetUser } = req.body || {};
+    const { targetUserId } = req.body || {};
 
     if (!targetUserId || targetUserId === user.id) {
       res.status(400).json({ error: 'Invalid user selected.' });
       return;
     }
 
-    let target = db.users.find((u) => u.id === targetUserId);
-    if (!target && targetUser && targetUser.id && targetUser.username) {
-      const now = new Date().toISOString();
-      target = {
-        id: String(targetUser.id),
-        fullName: String(targetUser.fullName || targetUser.username),
-        username: String(targetUser.username).toLowerCase(),
-        email: String(targetUser.email || `${targetUser.username}@gmail.com`).toLowerCase(),
-        passwordSalt: 'sha256_client',
-        passwordHash: '',
-        recoveryCodeSalt: 'sha256_client',
-        recoveryCodeHash: '',
-        bio: String(targetUser.bio || ''),
-        avatarUrl: String(targetUser.avatarUrl || ''),
-        createdAt: now,
-        lastSeen: now,
-        isOnline: Boolean(targetUser.isOnline),
-        usernameChangeTimestamps: [],
-        privacy: {
-          profilePicVisibility: 'everyone',
-          lastSeenVisibility: 'everyone',
-          readReceipts: true,
-          statusPrivacy: 'everyone',
-          whoCanContact: 'everyone',
-        },
-        notifications: {
-          messageAlerts: true,
-          soundEnabled: true,
-          previewText: true,
-        },
-        chatSettings: {
-          enterToSend: true,
-          fontSize: 'medium',
-          autoDownloadImages: true,
-        },
-      };
-      db.users.push(target);
-    }
+    const target = db.users.find((u) => u.id === targetUserId);
     if (!target) {
       res.status(404).json({ error: 'User not found.' });
       return;
@@ -1924,7 +1810,7 @@ export function createApiApp(
   app.post('/api/conversations/start', requireAuth, async (req, res) => {
     await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
-    const { recipientId, targetUser } = req.body || {};
+    const { recipientId } = req.body || {};
 
     if (!recipientId || typeof recipientId !== 'string') {
       res.status(400).json({ error: 'Recipient user ID is required.' });
@@ -1936,44 +1822,7 @@ export function createApiApp(
       return;
     }
 
-    let recipient = db.users.find((u) => u.id === recipientId);
-    if (!recipient && targetUser && targetUser.id && targetUser.username) {
-      const now = new Date().toISOString();
-      recipient = {
-        id: String(targetUser.id),
-        fullName: String(targetUser.fullName || targetUser.username),
-        username: String(targetUser.username).toLowerCase(),
-        email: String(targetUser.email || `${targetUser.username}@gmail.com`).toLowerCase(),
-        passwordSalt: 'sha256_client',
-        passwordHash: '',
-        recoveryCodeSalt: 'sha256_client',
-        recoveryCodeHash: '',
-        bio: String(targetUser.bio || ''),
-        avatarUrl: String(targetUser.avatarUrl || ''),
-        createdAt: now,
-        lastSeen: now,
-        isOnline: Boolean(targetUser.isOnline),
-        usernameChangeTimestamps: [],
-        privacy: {
-          profilePicVisibility: 'everyone',
-          lastSeenVisibility: 'everyone',
-          readReceipts: true,
-          statusPrivacy: 'everyone',
-          whoCanContact: 'everyone',
-        },
-        notifications: {
-          messageAlerts: true,
-          soundEnabled: true,
-          previewText: true,
-        },
-        chatSettings: {
-          enterToSend: true,
-          fontSize: 'medium',
-          autoDownloadImages: true,
-        },
-      };
-      db.users.push(recipient);
-    }
+    const recipient = db.users.find((u) => u.id === recipientId);
     if (!recipient) {
       res.status(404).json({ error: 'No user found.' });
       return;
@@ -2109,13 +1958,12 @@ export function createApiApp(
       await ensureCloudDatabaseLoaded(true);
       const user = (req as express.Request & { user: UserRecord }).user;
       const requestedConvId = req.params.conversationId;
-      const { text, imageId, replyToMessageId, clientTempId, recipientId, recipientUser, targetUser } =
+      const { text, imageId, replyToMessageId, clientTempId, recipientId } =
         req.body || {};
-      const effectiveRecipientUser = recipientUser || targetUser;
 
       let conv = db.conversations.find((c) => c.id === requestedConvId);
 
-      // If cold serverless lambda didn't have the conversation record yet, find by pair or reconstruct deterministically
+      // If conversation was started by deterministic ID or participant pair, find by pair or create if recipient exists in Supabase
       if (!conv && recipientId && typeof recipientId === 'string' && recipientId !== user.id) {
         const canonicalId = getDeterministicConversationId(user.id, recipientId);
         conv = db.conversations.find(
@@ -2125,58 +1973,20 @@ export function createApiApp(
               c.participantIds.includes(recipientId))
         );
         if (!conv) {
-          let recipientRecord = db.users.find((u) => u.id === recipientId);
-          if (!recipientRecord && effectiveRecipientUser && effectiveRecipientUser.id && effectiveRecipientUser.username) {
+          const recipientRecord = db.users.find((u) => u.id === recipientId);
+          if (recipientRecord) {
             const nowStr = new Date().toISOString();
-            recipientRecord = {
-              id: String(effectiveRecipientUser.id),
-              fullName: String(effectiveRecipientUser.fullName || effectiveRecipientUser.username),
-              username: String(effectiveRecipientUser.username).toLowerCase(),
-              email: String(
-                effectiveRecipientUser.email || `${effectiveRecipientUser.username}@gmail.com`
-              ).toLowerCase(),
-              passwordSalt: 'sha256_client',
-              passwordHash: '',
-              recoveryCodeSalt: 'sha256_client',
-              recoveryCodeHash: '',
-              bio: String(effectiveRecipientUser.bio || ''),
-              avatarUrl: String(effectiveRecipientUser.avatarUrl || ''),
+            const sortedPair = [user.id, recipientId].sort() as [string, string];
+            conv = {
+              id: canonicalId,
+              participantIds: sortedPair,
               createdAt: nowStr,
-              lastSeen: nowStr,
-              isOnline: Boolean(effectiveRecipientUser.isOnline),
-              usernameChangeTimestamps: [],
-              privacy: {
-                profilePicVisibility: 'everyone',
-                lastSeenVisibility: 'everyone',
-                readReceipts: true,
-                statusPrivacy: 'everyone',
-                whoCanContact: 'everyone',
-              },
-              notifications: {
-                messageAlerts: true,
-                soundEnabled: true,
-                previewText: true,
-              },
-              chatSettings: {
-                enterToSend: true,
-                fontSize: 'medium',
-                autoDownloadImages: true,
-              },
+              updatedAt: nowStr,
+              deletedBy: [],
+              clearedAt: {},
             };
-            db.users.push(recipientRecord);
+            db.conversations.push(conv);
           }
-
-          const nowStr = new Date().toISOString();
-          const sortedPair = [user.id, recipientId].sort() as [string, string];
-          conv = {
-            id: canonicalId,
-            participantIds: sortedPair,
-            createdAt: nowStr,
-            updatedAt: nowStr,
-            deletedBy: [],
-            clearedAt: {},
-          };
-          db.conversations.push(conv);
         }
       }
 

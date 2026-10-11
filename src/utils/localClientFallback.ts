@@ -630,41 +630,6 @@ export function installLocalFallbackInterceptor() {
             })
             .catch(() => {});
         }
-
-        if (
-          response.status === 401 &&
-          (urlStr.startsWith('/api/auth/login') || urlStr.startsWith('/api/auth/recover'))
-        ) {
-          const fallbackAuthRes = await handleFallbackApiRequest(urlStr, nextInit);
-          if (fallbackAuthRes.ok) {
-            return fallbackAuthRes;
-          }
-        }
-
-        if (
-          response.status === 401 &&
-          !urlStr.startsWith('/api/auth/login') &&
-          !urlStr.startsWith('/api/auth/recover') &&
-          !urlStr.startsWith('/api/auth/register')
-        ) {
-          const fallbackRes = await handleFallbackApiRequest(urlStr, nextInit);
-          if (fallbackRes.ok) {
-            return fallbackRes;
-          }
-        }
-
-        if (urlStr.startsWith('/api/users/search') && response.ok) {
-          const clone = response.clone();
-          const data = await clone.json();
-          if (data && data.result) {
-            return response;
-          }
-          const fallbackRes = await handleFallbackApiRequest(urlStr, nextInit);
-          const fallbackData = await fallbackRes.clone().json();
-          if (fallbackData && fallbackData.result) {
-            return fallbackRes;
-          }
-        }
         return response;
       }
       return response;
