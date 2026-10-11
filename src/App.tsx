@@ -30,6 +30,7 @@ import { SettingsView } from './components/SettingsView';
 import { UserSearchModal } from './components/UserSearchModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { formatRelativeTime } from './utils/media';
+import './firebase';
 
 type ActiveTab = 'chats' | 'status' | 'contacts' | 'settings';
 const DEMO_USER_IDS = new Set(['usr_clara_vance', 'usr_julian_mercer', 'usr_sora_takahashi']);
@@ -227,6 +228,20 @@ export default function App() {
       fetchConversationMessages(selectedConvId);
     }
   }, [selectedConvId, isOnline, fetchConversationMessages]);
+
+  // Periodic sync fallback for serverless hosts (e.g. Vercel) where persistent WebSockets may not stay open
+  useEffect(() => {
+    if (!token || !currentUser || !isOnline) return;
+    const interval = setInterval(() => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        fetchAllData();
+        if (selectedConvId) {
+          fetchConversationMessages(selectedConvId);
+        }
+      }
+    }, 6000);
+    return () => clearInterval(interval);
+  }, [token, currentUser?.id, isOnline, selectedConvId, fetchAllData, fetchConversationMessages]);
 
   useEffect(() => {
     if (!token || !currentUser || !isOnline) return;
