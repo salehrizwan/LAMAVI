@@ -229,19 +229,25 @@ function cleanParsedDatabase(parsed: DatabaseSchema): DatabaseSchema {
   return parsed;
 }
 
+import seedDatabaseRaw from '../data/seed_database.json';
+
 function loadLocalDatabase(): DatabaseSchema {
+  let baseDb = cleanParsedDatabase(
+    JSON.parse(JSON.stringify(seedDatabaseRaw)) as DatabaseSchema
+  );
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, 'utf-8');
-      return cleanParsedDatabase(JSON.parse(raw) as DatabaseSchema);
+      const localParsed = cleanParsedDatabase(JSON.parse(raw) as DatabaseSchema);
+      baseDb = mergeDatabases(baseDb, localParsed);
     }
   } catch (e) {
     console.error('Local DB read warning:', e);
   }
-  return createEmptyDb();
+  return baseDb;
 }
 
 export let db: DatabaseSchema = loadLocalDatabase();
@@ -403,7 +409,6 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
 let lastCloudSyncMs = 0;
 let firestoreQuotaBackoffUntilMs = 0;
 export let lastFirestoreQuotaError: string | null = null;
-let saveDebounceTimer: NodeJS.Timeout | null = null;
 
 // Sync state from Firestore Cloud with quota circuit-breaker protection
 export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
@@ -411,16 +416,21 @@ export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
   if (now < firestoreQuotaBackoffUntilMs) {
     return;
   }
-  const minInterval = force ? 15000 : 45000;
+  const minInterval = force ? 5000 : 30000;
   if (now - lastCloudSyncMs < minInterval) return;
   lastCloudSyncMs = now;
   try {
     const resState = await fetch(FIRESTORE_DOC_URL).catch(() => null);
     if (resState) {
       if (resState.status === 429) {
-        firestoreQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000; // 10-min circuit breaker on 429 Quota Exceeded
+        firestoreQuotaBackoffUntilMs = Date.now() + 5 * 60 * 1000; // 5-min circuit breaker on 429 Quota Exceeded
         lastFirestoreQuotaError =
-          'Firestore free daily quota (429 RESOURCE_EXHAUSTED) reached. Operating on persistent backend storage until daily quota resets at midnight Pacific Time.';
+          'Firebase Firestore free daily read quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Newly created accounts on other serverless instances cannot be fetched from Firestore until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
+        return;
+      }
+      if (resState.status === 403) {
+        lastFirestoreQuotaError =
+          'Firebase Firestore returned HTTP 403 PERMISSION_DENIED. Please verify Firestore security rules for lamavi_public/app_state.';
         return;
       }
       if (resState.ok) {
@@ -450,90 +460,87 @@ export async function saveDatabase(data: DatabaseSchema = db, syncMedia = false)
     // Ignore read-only filesystem errors on serverless
   }
 
-  // Respect Firestore 429 quota circuit-breaker and debounce cloud syncs to prevent quota exhaustion
+  // Respect Firestore 429 quota circuit-breaker
   if (Date.now() < firestoreQuotaBackoffUntilMs) {
     return;
   }
 
-  if (saveDebounceTimer) {
-    clearTimeout(saveDebounceTimer);
-  }
-
-  saveDebounceTimer = setTimeout(async () => {
-    if (Date.now() < firestoreQuotaBackoffUntilMs) return;
-    try {
-      const sessionsMap: Record<string, string> = {};
-      for (const s of data.sessions) {
-        sessionsMap[s.token] = s.userId;
-      }
-      const usersWithDigests = data.users.map((u) => ({
-        ...u,
-        passwordDigest: u.passwordHash,
-        recoveryDigest: u.recoveryCodeHash,
-      }));
-      const coreCopy = {
-        users: usersWithDigests,
-        sessions: data.sessions.slice(-200),
-        sessionsMap,
-        conversations: data.conversations,
-        messages: data.messages.slice(-500),
-        statuses: data.statuses,
-        statusViews: data.statusViews,
-        blocks: data.blocks,
-        contacts: data.contacts,
-        media: [],
-      };
-      const serializedCore = JSON.stringify(coreCopy);
-      if (serializedCore.length < 950000) {
-        const patchRes = await fetch(FIRESTORE_DOC_URL, {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            fields: {
-              stateJson: { stringValue: serializedCore },
-              updatedAt: { stringValue: new Date().toISOString() },
-            },
-          }),
-        }).catch(() => null);
-
-        if (patchRes && patchRes.status === 429) {
-          firestoreQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000;
-          lastFirestoreQuotaError =
-            'Firestore free daily write quota (429 RESOURCE_EXHAUSTED) reached. Changes are saved to persistent backend storage and will sync when daily quota resets.';
-          return;
-        }
-      }
-
-      if (syncMedia) {
-        const fittingMedia: MediaRecord[] = [];
-        let currentLen = 20;
-        for (let i = data.media.length - 1; i >= 0; i--) {
-          const itemStr = JSON.stringify(data.media[i]);
-          if (currentLen + itemStr.length < 850000) {
-            fittingMedia.unshift(data.media[i]);
-            currentLen += itemStr.length + 2;
-          }
-        }
-        const serializedMedia = JSON.stringify({ media: fittingMedia });
-        await fetch(FIRESTORE_MEDIA_URL, {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            fields: {
-              stateJson: { stringValue: serializedMedia },
-              updatedAt: { stringValue: new Date().toISOString() },
-            },
-          }),
-        }).catch(() => {});
-      }
-    } catch {
-      // Ignore serialization error
+  // IMPORTANT: Await the Firestore write directly (do NOT use setTimeout) so Vercel serverless functions do not freeze before persisting to Firestore!
+  try {
+    const sessionsMap: Record<string, string> = {};
+    for (const s of data.sessions) {
+      sessionsMap[s.token] = s.userId;
     }
-  }, 1500);
+    const usersWithDigests = data.users.map((u) => ({
+      ...u,
+      passwordDigest: u.passwordHash,
+      recoveryDigest: u.recoveryCodeHash,
+    }));
+    const coreCopy = {
+      users: usersWithDigests,
+      sessions: data.sessions.slice(-200),
+      sessionsMap,
+      conversations: data.conversations,
+      messages: data.messages.slice(-500),
+      statuses: data.statuses,
+      statusViews: data.statusViews,
+      blocks: data.blocks,
+      contacts: data.contacts,
+      media: [],
+    };
+    const serializedCore = JSON.stringify(coreCopy);
+    if (serializedCore.length < 950000) {
+      const patchRes = await fetch(FIRESTORE_DOC_URL, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fields: {
+            stateJson: { stringValue: serializedCore },
+            updatedAt: { stringValue: new Date().toISOString() },
+          },
+        }),
+      }).catch(() => null);
+
+      if (patchRes && patchRes.status === 429) {
+        firestoreQuotaBackoffUntilMs = Date.now() + 5 * 60 * 1000;
+        lastFirestoreQuotaError =
+          'Firebase Firestore free daily quota (HTTP 429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89.';
+        return;
+      }
+      if (patchRes && patchRes.ok) {
+        lastFirestoreQuotaError = null;
+      }
+    }
+
+    if (syncMedia) {
+      const fittingMedia: MediaRecord[] = [];
+      let currentLen = 20;
+      for (let i = data.media.length - 1; i >= 0; i--) {
+        const itemStr = JSON.stringify(data.media[i]);
+        if (currentLen + itemStr.length < 850000) {
+          fittingMedia.unshift(data.media[i]);
+          currentLen += itemStr.length + 2;
+        }
+      }
+      const serializedMedia = JSON.stringify({ media: fittingMedia });
+      await fetch(FIRESTORE_MEDIA_URL, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fields: {
+            stateJson: { stringValue: serializedMedia },
+            updatedAt: { stringValue: new Date().toISOString() },
+          },
+        }),
+      }).catch(() => {});
+    }
+  } catch {
+    // Ignore serialization error
+  }
 }
 
 // Initial cloud sync check on startup
@@ -1383,6 +1390,14 @@ export function createApiApp(
           .json({ error: 'This is your own account! Enter the other person’s username or Gmail to connect.' });
         return;
       }
+      if (lastFirestoreQuotaError) {
+        res.status(503).json({
+          error: lastFirestoreQuotaError,
+          result: null,
+          results: [],
+        });
+        return;
+      }
       res.json({ result: null, results: [] });
       return;
     }
@@ -1650,7 +1665,7 @@ export function createApiApp(
     };
 
     db.media.push(media);
-    await saveDatabase();
+    await saveDatabase(db, true);
 
     res.status(201).json({
       mediaId: media.id,

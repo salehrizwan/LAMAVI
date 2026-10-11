@@ -281,10 +281,16 @@ function normalizeParsedCloudState(rawObj: Record<string, unknown>): CloudState 
   return base;
 }
 
+import seedDatabaseRaw from '../../data/seed_database.json';
+
 let clientQuotaBackoffUntilMs = 0;
 let lastClientCloudReadMs = 0;
+let lastClientQuotaErrorMsg: string | null = null;
 
 async function readCloudState(force = false): Promise<CloudState> {
+  const seedState = normalizeParsedCloudState(
+    seedDatabaseRaw as unknown as Record<string, unknown>
+  );
   let cloudState: CloudState = emptyState();
   let localState: CloudState = emptyState();
 
@@ -306,6 +312,7 @@ async function readCloudState(force = false): Promise<CloudState> {
     try {
       const snapState = await getDoc(doc(clientDb, 'lamavi_public', 'app_state'));
       if (snapState && snapState.exists()) {
+        lastClientQuotaErrorMsg = null;
         const data = snapState.data();
         if (data && typeof data.stateJson === 'string') {
           cloudState = normalizeParsedCloudState(JSON.parse(data.stateJson));
@@ -314,12 +321,15 @@ async function readCloudState(force = false): Promise<CloudState> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes('resource-exhausted') || errMsg.includes('Quota exceeded') || errMsg.includes('429')) {
-        clientQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000;
+        clientQuotaBackoffUntilMs = Date.now() + 5 * 60 * 1000;
+        lastClientQuotaErrorMsg =
+          'Firebase Firestore free daily quota (429 RESOURCE_EXHAUSTED) is currently reached for project quiet-outcome-qmn89. Newly created accounts on other devices cannot be fetched until daily quota resets at midnight Pacific Time or Firebase billing is enabled.';
       }
     }
   }
 
-  const resolved = mergeCloudStates(cloudState, localState);
+  const mergedSeedAndCloud = mergeCloudStates(seedState, cloudState);
+  const resolved = mergeCloudStates(mergedSeedAndCloud, localState);
   const nowIso = new Date().toISOString();
 
   // Enforce 7-day message/media expiration & 24-hour status expiration
@@ -938,6 +948,13 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       if (isSelfSearch) {
         return jsonResponse(400, {
           error: 'This is your own account! Enter the other person’s username or Gmail to connect.',
+        });
+      }
+      if (lastClientQuotaErrorMsg) {
+        return jsonResponse(503, {
+          error: lastClientQuotaErrorMsg,
+          result: null,
+          results: [],
         });
       }
       return jsonResponse(200, { result: null, results: [] });
