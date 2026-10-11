@@ -135,36 +135,190 @@ function emptyState(): CloudState {
   };
 }
 
+function mergeCloudStates(a: CloudState, b: CloudState): CloudState {
+  const userMap = new Map<string, StoredUser>();
+  for (const u of [...(a.users || []), ...(b.users || [])]) {
+    const key = (u.username || '').toLowerCase();
+    if (!key) continue;
+    const prev = userMap.get(key);
+    if (!prev) {
+      userMap.set(key, u);
+    } else {
+      userMap.set(key, {
+        ...prev,
+        ...u,
+        id: prev.id || u.id,
+        avatarUrl: u.avatarUrl || prev.avatarUrl,
+        bio: u.bio || prev.bio,
+        fullName: u.fullName || prev.fullName,
+        passwordDigest: u.passwordDigest || prev.passwordDigest,
+        recoveryDigest: u.recoveryDigest || prev.recoveryDigest,
+      });
+    }
+  }
+
+  const sessions: Record<string, string> = {
+    ...(a.sessions || {}),
+    ...(b.sessions || {}),
+  };
+
+  const convMap = new Map<string, StoredConversation>();
+  for (const c of [...(a.conversations || []), ...(b.conversations || [])]) {
+    convMap.set(c.id, c);
+  }
+
+  const msgMap = new Map<string, StoredMessage>();
+  for (const m of [...(a.messages || []), ...(b.messages || [])]) {
+    msgMap.set(m.id, m);
+  }
+
+  const mediaMap = new Map<string, StoredMedia>();
+  for (const med of [...(a.media || []), ...(b.media || [])]) {
+    mediaMap.set(med.id, med);
+  }
+
+  const statusMap = new Map<string, StoredStatus>();
+  for (const s of [...(a.statuses || []), ...(b.statuses || [])]) {
+    statusMap.set(s.id, { ...s, viewers: s.viewers || [] });
+  }
+
+  const contactSet = new Set<string>();
+  const contacts: { userId: string; contactUserId: string }[] = [];
+  for (const ct of [...(a.contacts || []), ...(b.contacts || [])]) {
+    const k = `${ct.userId}:${ct.contactUserId}`;
+    if (!contactSet.has(k)) {
+      contactSet.add(k);
+      contacts.push({ userId: ct.userId, contactUserId: ct.contactUserId });
+    }
+  }
+
+  const blockSet = new Set<string>();
+  const blocks: { blockerId: string; blockedUserId: string }[] = [];
+  for (const bl of [...(a.blocks || []), ...(b.blocks || [])]) {
+    const k = `${bl.blockerId}:${bl.blockedUserId}`;
+    if (!blockSet.has(k)) {
+      blockSet.add(k);
+      blocks.push({ blockerId: bl.blockerId, blockedUserId: bl.blockedUserId });
+    }
+  }
+
+  return {
+    users: Array.from(userMap.values()),
+    sessions,
+    conversations: Array.from(convMap.values()),
+    messages: Array.from(msgMap.values()),
+    media: Array.from(mediaMap.values()),
+    statuses: Array.from(statusMap.values()),
+    contacts,
+    blocks,
+  };
+}
+
+function normalizeParsedCloudState(rawObj: Record<string, unknown>): CloudState {
+  const base = emptyState();
+  const rawUsers = Array.isArray(rawObj.users) ? rawObj.users : [];
+  base.users = rawUsers.map((u: Record<string, unknown>) => ({
+    id: String(u.id || ''),
+    fullName: String(u.fullName || ''),
+    username: String(u.username || ''),
+    email: String(u.email || ''),
+    passwordDigest: String(u.passwordDigest || u.passwordHash || ''),
+    recoveryDigest: String(u.recoveryDigest || u.recoveryCodeHash || ''),
+    bio: String(u.bio || ''),
+    avatarUrl: String(u.avatarUrl || ''),
+    createdAt: String(u.createdAt || new Date().toISOString()),
+    lastSeen: String(u.lastSeen || new Date().toISOString()),
+    isOnline: Boolean(u.isOnline),
+    usernameChangeTimestamps: Array.isArray(u.usernameChangeTimestamps)
+      ? (u.usernameChangeTimestamps as string[])
+      : [],
+    privacy: (u.privacy as PrivacySettings) || {
+      profilePicVisibility: 'everyone',
+      lastSeenVisibility: 'everyone',
+      readReceipts: true,
+      statusPrivacy: 'everyone',
+      whoCanContact: 'everyone',
+    },
+    notifications: (u.notifications as NotificationSettings) || {
+      messageAlerts: true,
+      soundEnabled: true,
+      previewText: true,
+    },
+    chatSettings: (u.chatSettings as ChatSettings) || {
+      enterToSend: true,
+      fontSize: 'medium',
+      autoDownloadImages: true,
+    },
+  }));
+
+  if (Array.isArray(rawObj.sessions)) {
+    for (const s of rawObj.sessions as Array<{ token?: string; userId?: string }>) {
+      if (s && s.token && s.userId) {
+        base.sessions[s.token] = s.userId;
+      }
+    }
+  } else if (rawObj.sessions && typeof rawObj.sessions === 'object') {
+    base.sessions = { ...(rawObj.sessions as Record<string, string>) };
+  }
+  if (rawObj.sessionsMap && typeof rawObj.sessionsMap === 'object') {
+    base.sessions = { ...base.sessions, ...(rawObj.sessionsMap as Record<string, string>) };
+  }
+
+  base.conversations = Array.isArray(rawObj.conversations)
+    ? (rawObj.conversations as StoredConversation[])
+    : [];
+  base.messages = Array.isArray(rawObj.messages) ? (rawObj.messages as StoredMessage[]) : [];
+  base.media = Array.isArray(rawObj.media) ? (rawObj.media as StoredMedia[]) : [];
+  base.statuses = Array.isArray(rawObj.statuses)
+    ? (rawObj.statuses as StoredStatus[]).map((s) => ({ ...s, viewers: s.viewers || [] }))
+    : [];
+  base.contacts = Array.isArray(rawObj.contacts)
+    ? (rawObj.contacts as { userId: string; contactUserId: string }[])
+    : [];
+  base.blocks = Array.isArray(rawObj.blocks)
+    ? (rawObj.blocks as { blockerId: string; blockedUserId: string }[])
+    : [];
+  return base;
+}
+
 async function readCloudState(): Promise<CloudState> {
-  let state: CloudState | null = null;
+  let cloudState: CloudState = emptyState();
+  let localState: CloudState = emptyState();
+
+  try {
+    const raw = localStorage.getItem(LOCAL_CLOUD_KEY);
+    if (raw) {
+      localState = normalizeParsedCloudState(JSON.parse(raw));
+    }
+  } catch {
+    // ignore
+  }
+
   try {
     const snap = await getDoc(doc(clientDb, 'lamavi_public', 'app_state'));
     if (snap.exists()) {
       const data = snap.data();
       if (data && typeof data.stateJson === 'string') {
-        state = JSON.parse(data.stateJson) as CloudState;
+        cloudState = normalizeParsedCloudState(JSON.parse(data.stateJson));
       }
     }
   } catch {
-    // Fallback to localStorage if Firestore rules haven't propagated yet
+    // Fallback to localStorage if offline
   }
 
-  if (!state) {
-    try {
-      const raw = localStorage.getItem(LOCAL_CLOUD_KEY);
-      if (raw) state = JSON.parse(raw) as CloudState;
-    } catch {
-      // ignore
-    }
-  }
-
-  const resolved = state || emptyState();
+  const resolved = mergeCloudStates(cloudState, localState);
   const nowIso = new Date().toISOString();
 
   // Enforce 7-day message/media expiration & 24-hour status expiration
-  resolved.messages = (resolved.messages || []).filter((m) => m.expiresAt > nowIso);
-  resolved.media = (resolved.media || []).filter((med) => med.expiresAt > nowIso);
-  resolved.statuses = (resolved.statuses || []).filter((s) => s.expiresAt > nowIso);
+  resolved.messages = (resolved.messages || []).filter((m) => !m.expiresAt || m.expiresAt > nowIso);
+  resolved.media = (resolved.media || []).filter((med) => !med.expiresAt || med.expiresAt > nowIso);
+  resolved.statuses = (resolved.statuses || []).filter((s) => !s.expiresAt || s.expiresAt > nowIso);
+
+  // If local had users that weren't in cloud yet, push merged state back to cloud
+  if (resolved.users.length > cloudState.users.length) {
+    writeCloudState(resolved).catch(() => {});
+  }
+
   return resolved;
 }
 
@@ -177,7 +331,7 @@ async function writeCloudState(state: CloudState): Promise<void> {
   try {
     const trimmedState: CloudState = {
       ...state,
-      media: state.media.slice(-15),
+      media: state.media.slice(-8),
     };
     const stateJson = JSON.stringify(trimmedState);
     if (stateJson.length < 950000) {
@@ -221,8 +375,11 @@ function toUserProfile(u: StoredUser, viewerId: string, state: CloudState): User
   };
 }
 
-// Intercept `/api/*` calls automatically when running on a static host where the backend returns 404/HTML or throws a network error
+// Intercept `/api/*` calls automatically when running on a static host where the backend returns 404/HTML or throws a network error, and also sync any local device accounts up to Firestore on boot
 export function installServerlessFallbackInterceptor() {
+  // Immediately sync any locally stored accounts on this device to Firestore so other devices can find them
+  readCloudState().catch(() => {});
+
   const originalFetch = window.fetch.bind(window);
 
   const wrappedFetch: typeof window.fetch = async (input, init) => {
@@ -234,11 +391,23 @@ export function installServerlessFallbackInterceptor() {
     try {
       const response = await originalFetch(input, init);
       const contentType = response.headers.get('content-type') || '';
-      // If the backend returned a valid JSON response, use it directly!
       if (contentType.includes('application/json')) {
+        // If this was a user search that returned null on the backend, also check client cloud state as a safety net
+        if (urlStr.startsWith('/api/users/search') && response.ok) {
+          const clone = response.clone();
+          const data = await clone.json();
+          if (data && data.result) {
+            return response;
+          }
+          // Try client cloud fallback if server returned null
+          const fallbackRes = await handleFallbackApiRequest(urlStr, init);
+          const fallbackData = await fallbackRes.clone().json();
+          if (fallbackData && fallbackData.result) {
+            return fallbackRes;
+          }
+        }
         return response;
       }
-      // Otherwise (e.g. Vercel static 404 HTML page or 502), fall through to Firebase Cloud handler
     } catch {
       // Network error reaching `/api/*` -> fall through to Firebase Cloud handler
     }
@@ -454,10 +623,18 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   // Search
   if (pathname === '/api/users/search' && method === 'GET') {
     const rawQ = (url.searchParams.get('q') || '').trim().toLowerCase();
-    const normQ = rawQ.startsWith('@') ? rawQ.slice(1) : rawQ;
-    const found = state.users.find(
-      (u) => u.username.toLowerCase() === normQ || u.email.toLowerCase() === rawQ
-    );
+    const normQ = rawQ.startsWith('@') ? rawQ.slice(1).trim() : rawQ;
+    const found = state.users.find((u) => {
+      const uname = (u.username || '').trim().toLowerCase();
+      const uemail = (u.email || '').trim().toLowerCase();
+      const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
+      return (
+        uname === normQ ||
+        uemail === normQ ||
+        uemail === `${normQ}@gmail.com` ||
+        (emailPrefix && emailPrefix === normQ)
+      );
+    });
     if (!found) return jsonResponse(200, { result: null });
     if (found.id === currentUser.id) {
       return jsonResponse(400, { error: 'You cannot start a conversation with yourself.' });

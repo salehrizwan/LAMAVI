@@ -245,32 +245,135 @@ function loadLocalDatabase(): DatabaseSchema {
 }
 
 export let db: DatabaseSchema = loadLocalDatabase();
-let cloudLoaded = false;
 
-const FIRESTORE_DOC_URL = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/lamavi_store/core_state?key=${firebaseConfig.apiKey}`;
+const FIRESTORE_DOC_URL = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/lamavi_public/app_state?key=${firebaseConfig.apiKey}`;
 
-// Sync state from Firestore Cloud so Vercel cold starts recover all accounts & messages
-export async function ensureCloudDatabaseLoaded(): Promise<void> {
-  if (cloudLoaded) return;
-  try {
-    const res = await fetch(FIRESTORE_DOC_URL, {
-      headers: {
-        Authorization: 'Bearer owner',
-      },
-    });
-    if (res.ok) {
-      const docData = await res.json();
-      const rawJson = docData?.fields?.payloadJson?.stringValue;
-      if (typeof rawJson === 'string') {
-        const parsed = cleanParsedDatabase(JSON.parse(rawJson) as DatabaseSchema);
-        if (parsed.users.length >= db.users.length) {
-          db = parsed;
-        }
+function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>): DatabaseSchema {
+  const userMap = new Map<string, UserRecord>();
+  for (const u of base.users || []) {
+    userMap.set(u.username.toLowerCase(), u);
+  }
+  for (const rawU of incoming.users || []) {
+    const u = rawU as UserRecord & { passwordDigest?: string; recoveryDigest?: string };
+    const key = (u.username || '').toLowerCase();
+    if (!key) continue;
+    const existing = userMap.get(key);
+    if (!existing) {
+      userMap.set(key, {
+        ...u,
+        passwordSalt: u.passwordSalt || 'sha256_client',
+        passwordHash: u.passwordHash || u.passwordDigest || '',
+        recoveryCodeSalt: u.recoveryCodeSalt || 'sha256_client',
+        recoveryCodeHash: u.recoveryCodeHash || u.recoveryDigest || '',
+        usernameChangeTimestamps: u.usernameChangeTimestamps || [],
+      });
+    } else {
+      // Keep the most recently updated profile fields (avatar, bio, fullName, lastSeen)
+      const incomingTime = u.lastSeen || u.createdAt || '';
+      const existingTime = existing.lastSeen || existing.createdAt || '';
+      if (incomingTime >= existingTime || (u.avatarUrl && !existing.avatarUrl) || (u.bio && !existing.bio)) {
+        userMap.set(key, {
+          ...existing,
+          ...u,
+          id: existing.id,
+          avatarUrl: u.avatarUrl || existing.avatarUrl,
+          bio: u.bio || existing.bio,
+          fullName: u.fullName || existing.fullName,
+          passwordSalt: existing.passwordSalt || u.passwordSalt || 'sha256_client',
+          passwordHash: existing.passwordHash || u.passwordHash || u.passwordDigest || '',
+          recoveryCodeSalt: existing.recoveryCodeSalt || u.recoveryCodeSalt || 'sha256_client',
+          recoveryCodeHash: existing.recoveryCodeHash || u.recoveryCodeHash || u.recoveryDigest || '',
+        });
       }
     }
-    cloudLoaded = true;
+  }
+
+  const sessionMap = new Map<string, SessionRecord>();
+  for (const s of base.sessions || []) {
+    sessionMap.set(s.token, s);
+  }
+  if (Array.isArray(incoming.sessions)) {
+    for (const s of incoming.sessions) {
+      sessionMap.set(s.token, s);
+    }
+  } else if (incoming.sessions && typeof incoming.sessions === 'object') {
+    const now = new Date().toISOString();
+    const exp = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    for (const [tok, uid] of Object.entries(incoming.sessions as Record<string, string>)) {
+      if (!sessionMap.has(tok)) {
+        sessionMap.set(tok, { token: tok, userId: String(uid), createdAt: now, expiresAt: exp });
+      }
+    }
+  }
+
+  const convMap = new Map<string, ConversationRecord>();
+  for (const c of [...(base.conversations || []), ...(incoming.conversations || [])]) {
+    convMap.set(c.id, c);
+  }
+
+  const msgMap = new Map<string, MessageRecord>();
+  for (const m of [...(base.messages || []), ...(incoming.messages || [])]) {
+    msgMap.set(m.id, m);
+  }
+
+  const mediaMap = new Map<string, MediaRecord>();
+  for (const med of [...(base.media || []), ...(incoming.media || [])]) {
+    mediaMap.set(med.id, med);
+  }
+
+  const statusMap = new Map<string, StatusRecord>();
+  for (const st of [...(base.statuses || []), ...(incoming.statuses || [])]) {
+    statusMap.set(st.id, st);
+  }
+
+  const contactKeySet = new Set<string>();
+  const mergedContacts: ContactRecord[] = [];
+  for (const ct of [...(base.contacts || []), ...(incoming.contacts || [])]) {
+    const key = `${ct.userId}:${ct.contactUserId}`;
+    if (!contactKeySet.has(key)) {
+      contactKeySet.add(key);
+      mergedContacts.push({
+        id: ct.id || `cnt_${crypto.randomBytes(6).toString('hex')}`,
+        userId: ct.userId,
+        contactUserId: ct.contactUserId,
+        createdAt: ct.createdAt || new Date().toISOString(),
+      });
+    }
+  }
+
+  return cleanParsedDatabase({
+    users: Array.from(userMap.values()),
+    sessions: Array.from(sessionMap.values()),
+    conversations: Array.from(convMap.values()),
+    messages: Array.from(msgMap.values()),
+    media: Array.from(mediaMap.values()),
+    statuses: Array.from(statusMap.values()),
+    statusViews: base.statusViews || [],
+    blocks: base.blocks || [],
+    reports: base.reports || [],
+    contacts: mergedContacts,
+  });
+}
+
+let lastCloudSyncMs = 0;
+
+// Sync state from Firestore Cloud so AI Studio, Vercel, Laptop & Mobile share all accounts & messages
+export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
+  const now = Date.now();
+  if (!force && now - lastCloudSyncMs < 2500) return;
+  lastCloudSyncMs = now;
+  try {
+    const res = await fetch(FIRESTORE_DOC_URL);
+    if (res.ok) {
+      const docData = await res.json();
+      const rawJson = docData?.fields?.stateJson?.stringValue;
+      if (typeof rawJson === 'string') {
+        const parsed = JSON.parse(rawJson) as Partial<DatabaseSchema>;
+        db = mergeDatabases(db, parsed);
+      }
+    }
   } catch {
-    cloudLoaded = true;
+    // Fallback to local filesystem db seamlessly
   }
 }
 
@@ -286,23 +389,27 @@ export function saveDatabase(data: DatabaseSchema = db) {
     // Ignore read-only filesystem errors on serverless
   }
 
-  // Persist asynchronously to Firebase Firestore (excluding heavy media blobs if over 800KB to respect 1MB doc limit)
+  // Persist asynchronously to Firebase Firestore `/lamavi_public/app_state` so all devices see updates immediately
   try {
-    const lightCopy: DatabaseSchema = {
+    const sessionsMap: Record<string, string> = {};
+    for (const s of data.sessions) {
+      sessionsMap[s.token] = s.userId;
+    }
+    const lightCopy = {
       ...data,
-      media: data.media.slice(-15),
+      sessionsMap,
+      media: data.media.slice(-8),
     };
     const serialized = JSON.stringify(lightCopy);
-    if (serialized.length < 900000) {
+    if (serialized.length < 950000) {
       fetch(FIRESTORE_DOC_URL, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: 'Bearer owner',
         },
         body: JSON.stringify({
           fields: {
-            payloadJson: { stringValue: serialized },
+            stateJson: { stringValue: serialized },
             updatedAt: { stringValue: new Date().toISOString() },
           },
         }),
@@ -312,6 +419,11 @@ export function saveDatabase(data: DatabaseSchema = db) {
     // Ignore serialization error
   }
 }
+
+// Seed cloud store on startup so existing local accounts (`saleh123`, `ahmad123`, etc.) are immediately in Firestore
+ensureCloudDatabaseLoaded(true).then(() => {
+  saveDatabase(db);
+});
 
 function hashSecret(
   secret: string,
@@ -327,6 +439,11 @@ function verifySecret(
   salt: string,
   expectedHash: string
 ): boolean {
+  if (!expectedHash) return false;
+  if (salt === 'sha256_client') {
+    const sha = crypto.createHash('sha256').update(secret).digest('hex');
+    return sha === expectedHash;
+  }
   const { hash } = hashSecret(secret, salt);
   return crypto.timingSafeEqual(
     Buffer.from(hash, 'hex'),
@@ -949,7 +1066,8 @@ export function createApiApp(
   });
 
   // --- EXACT USERNAME & REGISTERED EMAIL SEARCH ---
-  app.get('/api/users/search', requireAuth, (req, res) => {
+  app.get('/api/users/search', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const rawQuery =
       typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
@@ -962,14 +1080,20 @@ export function createApiApp(
     }
 
     const normalizedQuery = rawQuery.startsWith('@')
-      ? rawQuery.slice(1)
+      ? rawQuery.slice(1).trim()
       : rawQuery;
 
-    const found = db.users.find(
-      (u) =>
-        u.username.toLowerCase() === normalizedQuery ||
-        (u.email && u.email.toLowerCase() === rawQuery)
-    );
+    const found = db.users.find((u) => {
+      const uname = (u.username || '').trim().toLowerCase();
+      const uemail = (u.email || '').trim().toLowerCase();
+      const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
+      return (
+        uname === normalizedQuery ||
+        uemail === normalizedQuery ||
+        uemail === `${normalizedQuery}@gmail.com` ||
+        (emailPrefix && emailPrefix === normalizedQuery)
+      );
+    });
 
     if (!found) {
       res.json({ result: null });

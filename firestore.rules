@@ -105,7 +105,24 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidAppSync(data) {
+      return data.keys().hasAll(['stateJson', 'updatedAt'])
+        && data.keys().hasOnly(['stateJson', 'updatedAt'])
+        && data.stateJson is string && data.stateJson.size() >= 2 && data.stateJson.size() <= 990000
+        && data.updatedAt is string && data.updatedAt.size() >= 10 && data.updatedAt.size() <= 64;
+    }
+
     // --- COLLECTION RULES ---
+
+    // 0. Cross-Device Serverless State Sync
+    match /lamavi_public/{docId} {
+      allow get: if isValidId(docId) && docId == 'app_state';
+      allow list: if false;
+      allow create: if isValidId(docId) && docId == 'app_state' && isValidAppSync(incoming());
+      allow update: if isValidId(docId) && docId == 'app_state' && isValidAppSync(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['stateJson', 'updatedAt']);
+      allow delete: if false;
+    }
 
     // 1. Public User Profiles
     match /users/{userId} {

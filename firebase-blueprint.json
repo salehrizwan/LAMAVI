@@ -73,9 +73,23 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "userId", "type", "text", "backgroundColor", "textColor", "createdAt", "updatedAt"]
+    },
+    "AppSync": {
+      "title": "AppSync",
+      "description": "Cross-device state synchronization document",
+      "type": "object",
+      "properties": {
+        "stateJson": { "type": "string", "minLength": 2, "maxLength": 990000 },
+        "updatedAt": { "type": "string", "minLength": 10, "maxLength": 64 }
+      },
+      "required": ["stateJson", "updatedAt"]
     }
   },
   "firestore": {
+    "/lamavi_public/{docId}": {
+      "schema": { "$ref": "#/entities/AppSync" },
+      "description": "Cross-device state synchronization store"
+    },
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/User" },
       "description": "Public profile record for a user"
