@@ -534,9 +534,6 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
   });
 }
 
-export let lastFirestoreQuotaError: string | null = null;
-export let lastFirestoreCloudVerifiedAt: string | null = null;
-
 export async function ensureCloudDatabaseLoaded(_force = false): Promise<void> {
   if (getActiveDbProvider() === 'supabase') {
     const remoteDb = await loadDatabaseFromSupabase();
@@ -850,7 +847,7 @@ export function createApiApp(
 
     let user = resolveUserFromToken(token);
     if (!user) {
-      // Force reload from Firestore in case account/session was just created on another serverless instance
+      // Force reload from Supabase in case account/session was just created on another serverless instance
       await ensureCloudDatabaseLoaded(true);
       user = resolveUserFromToken(token);
     }
@@ -1056,7 +1053,7 @@ export function createApiApp(
       res.status(saveRes.status || 503).json({
         error:
           saveRes.error ||
-          'Failed to persist new account to Firebase Firestore. Please try again after Firestore quota resets.',
+          'Failed to persist new account to Supabase database. Please verify database connectivity and try again.',
       });
       return;
     }
@@ -1467,14 +1464,6 @@ export function createApiApp(
         res
           .status(400)
           .json({ error: 'This is your own account! Enter the other person’s username or Gmail to connect.' });
-        return;
-      }
-      if (lastFirestoreQuotaError) {
-        res.status(503).json({
-          error: lastFirestoreQuotaError,
-          result: null,
-          results: [],
-        });
         return;
       }
       res.json({ result: null, results: [] });
@@ -1929,7 +1918,6 @@ export function createApiApp(
 
     res.json({
       conversations: getConversationsForUser(user.id),
-      quotaWarning: lastFirestoreQuotaError || undefined,
     });
   });
 
@@ -2110,7 +2098,6 @@ export function createApiApp(
         hasMore,
         nextCursor,
         conversationId: conv.id,
-        quotaWarning: lastFirestoreQuotaError || undefined,
       });
     }
   );
@@ -2295,7 +2282,6 @@ export function createApiApp(
 
       res.status(201).json({
         message: formatMessageForUser(newMessage, user.id),
-        quotaWarning: lastFirestoreQuotaError || undefined,
       });
     }
   );

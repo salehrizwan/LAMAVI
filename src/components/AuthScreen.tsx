@@ -48,6 +48,14 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const hasDigit = /[0-9]/.test(activePw);
   const isPasswordValid = isExactly8 && hasLetter && hasDigit;
 
+  const sanitizeAuthErrorMessage = (rawErr: unknown, fallback: string): string => {
+    const msg = typeof rawErr === 'string' && rawErr.trim() ? rawErr.trim() : fallback;
+    if (/firebase|firestore|quota|reset.*midnight|resource_exhausted/i.test(msg)) {
+      return 'Could not connect to the LAMAVI authentication server. Please refresh the page and try again.';
+    }
+    return msg;
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
@@ -66,9 +74,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
           password: loginPassword,
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setErrorMsg(data.error || 'Failed to log in.');
+        setErrorMsg(sanitizeAuthErrorMessage(data.error, 'Incorrect username/Gmail or password.'));
       } else {
         onAuthenticated(data.token, data.user);
       }
@@ -124,9 +132,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
           password,
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setErrorMsg(data.error || 'Account creation failed.');
+        setErrorMsg(sanitizeAuthErrorMessage(data.error, 'Account creation failed.'));
       } else {
         setCreatedSession({
           token: data.token,

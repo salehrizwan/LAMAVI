@@ -644,7 +644,8 @@ export function installLocalFallbackInterceptor() {
         if (
           response.status === 401 &&
           !urlStr.startsWith('/api/auth/login') &&
-          !urlStr.startsWith('/api/auth/recover')
+          !urlStr.startsWith('/api/auth/recover') &&
+          !urlStr.startsWith('/api/auth/register')
         ) {
           const fallbackRes = await handleFallbackApiRequest(urlStr, nextInit);
           if (fallbackRes.ok) {
@@ -666,6 +667,7 @@ export function installLocalFallbackInterceptor() {
         }
         return response;
       }
+      return response;
     } catch {
       // Network error reaching `/api/*` -> fall through to local handler
     }

@@ -498,10 +498,26 @@ export async function saveDatabaseToSupabase(
 
   try {
     // 1. Upsert users first (foreign key parent for sessions, messages, contacts, etc.)
-    // Use on_conflict=id and ensure unique username/email integrity
-    await upsertTableRows('lamavi_users', data.users.map(mapUserToRow), 'id');
+    // Deduplicate by id, username, and email so PostgreSQL unique constraints never reject batch upserts
+    const seenIds = new Set<string>();
+    const seenUsernames = new Set<string>();
+    const seenEmails = new Set<string>();
+    const deduplicatedUsers: UserRecord[] = [];
+    for (const u of data.users) {
+      const uid = String(u.id || '').trim();
+      const uname = String(u.username || '').trim().toLowerCase();
+      const uemail = String(u.email || '').trim().toLowerCase();
+      if (!uid || !uname || !uemail) continue;
+      if (seenIds.has(uid) || seenUsernames.has(uname) || seenEmails.has(uemail)) continue;
+      seenIds.add(uid);
+      seenUsernames.add(uname);
+      seenEmails.add(uemail);
+      deduplicatedUsers.push(u);
+    }
 
-    const validUserIds = new Set(data.users.map((u) => u.id));
+    await upsertTableRows('lamavi_users', deduplicatedUsers.map(mapUserToRow), 'id');
+
+    const validUserIds = new Set(deduplicatedUsers.map((u) => u.id));
 
     // 2. Upsert sessions for existing users
     const validSessions = data.sessions.filter((s) => validUserIds.has(s.userId));
