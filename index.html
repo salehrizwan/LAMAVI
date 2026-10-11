@@ -28,13 +28,25 @@
           if (typeof Window !== 'undefined' && Window.prototype) {
             patchTarget(Window.prototype);
           }
+          var isExtensionError = function (msg, filename, stack) {
+            var m = String(msg || '');
+            var f = String(filename || '');
+            var s = String(stack || '');
+            return (
+              f.indexOf('chrome-extension://') !== -1 ||
+              f.indexOf('moz-extension://') !== -1 ||
+              s.indexOf('chrome-extension://') !== -1 ||
+              s.indexOf('moz-extension://') !== -1 ||
+              m.indexOf('chrome-extension://') !== -1 ||
+              m.indexOf('chrome: call method') !== -1 ||
+              m.indexOf('Cannot set property fetch') !== -1
+            );
+          };
           window.addEventListener(
             'error',
             function (e) {
-              if (
-                (e.filename && e.filename.indexOf('chrome-extension://') === 0) ||
-                (e.message && e.message.indexOf('Cannot set property fetch') !== -1)
-              ) {
+              var errStack = e.error && e.error.stack;
+              if (isExtensionError(e.message, e.filename, errStack)) {
                 e.stopImmediatePropagation();
                 e.preventDefault();
                 return false;
@@ -45,8 +57,10 @@
           window.addEventListener(
             'unhandledrejection',
             function (e) {
-              var msg = e.reason && (e.reason.message || String(e.reason));
-              if (msg && msg.indexOf('Cannot set property fetch') !== -1) {
+              var reason = e.reason;
+              var msg = reason && (reason.message || String(reason));
+              var stack = reason && reason.stack;
+              if (isExtensionError(msg, '', stack)) {
                 e.stopImmediatePropagation();
                 e.preventDefault();
                 return false;
