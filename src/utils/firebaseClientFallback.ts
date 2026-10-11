@@ -295,11 +295,26 @@ async function readCloudState(): Promise<CloudState> {
   }
 
   try {
-    const snap = await getDoc(doc(clientDb, 'lamavi_public', 'app_state'));
-    if (snap.exists()) {
-      const data = snap.data();
+    const [snapState, snapMedia] = await Promise.all([
+      getDoc(doc(clientDb, 'lamavi_public', 'app_state')).catch(() => null),
+      getDoc(doc(clientDb, 'lamavi_public', 'app_media')).catch(() => null),
+    ]);
+    if (snapState && snapState.exists()) {
+      const data = snapState.data();
       if (data && typeof data.stateJson === 'string') {
         cloudState = normalizeParsedCloudState(JSON.parse(data.stateJson));
+      }
+    }
+    if (snapMedia && snapMedia.exists()) {
+      const mData = snapMedia.data();
+      if (mData && typeof mData.stateJson === 'string') {
+        const parsedMediaObj = JSON.parse(mData.stateJson) as { media?: StoredMedia[] };
+        if (Array.isArray(parsedMediaObj.media)) {
+          cloudState = mergeCloudStates(cloudState, {
+            ...emptyState(),
+            media: parsedMediaObj.media,
+          });
+        }
       }
     }
   } catch {
@@ -329,17 +344,35 @@ async function writeCloudState(state: CloudState): Promise<void> {
     // ignore
   }
   try {
-    const trimmedState: CloudState = {
+    // Store core users, sessions, conversations, messages, statuses, contacts in `app_state` without heavy base64 media so it never exceeds 1MB
+    const coreState: CloudState = {
       ...state,
-      media: state.media.slice(-8),
+      messages: state.messages.slice(-500),
+      media: [],
     };
-    const stateJson = JSON.stringify(trimmedState);
+    const stateJson = JSON.stringify(coreState);
     if (stateJson.length < 950000) {
       await setDoc(doc(clientDb, 'lamavi_public', 'app_state'), {
         stateJson,
         updatedAt: new Date().toISOString(),
       });
     }
+
+    // Store fitting media items in `app_media` under 850KB
+    const fittingMedia: StoredMedia[] = [];
+    let currentLen = 20;
+    for (let i = state.media.length - 1; i >= 0; i--) {
+      const itemStr = JSON.stringify(state.media[i]);
+      if (currentLen + itemStr.length < 850000) {
+        fittingMedia.unshift(state.media[i]);
+        currentLen += itemStr.length + 2;
+      }
+    }
+    const mediaJson = JSON.stringify({ media: fittingMedia });
+    await setDoc(doc(clientDb, 'lamavi_public', 'app_media'), {
+      stateJson: mediaJson,
+      updatedAt: new Date().toISOString(),
+    });
   } catch {
     // ignore if offline
   }
@@ -403,11 +436,22 @@ export function installServerlessFallbackInterceptor() {
       headers: mergedHeaders,
     };
 
+    const reqBodyObj =
+      init?.body && typeof init.body === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(init.body) as Record<string, unknown>;
+            } catch {
+              return {};
+            }
+          })()
+        : {};
+
     try {
       const response = await originalFetch(input, nextInit);
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
-        // When register or login succeeds on backend, mirror the user & token into client cloud state too so client fallback always recognizes the session
+        // When register or login succeeds on backend, mirror the user, passwordDigest & token into client cloud state too so any device can log in or search them!
         if (
           response.ok &&
           (urlStr.startsWith('/api/auth/register') ||
@@ -425,14 +469,32 @@ export function installServerlessFallbackInterceptor() {
                     u.id === data.user.id ||
                     u.username.toLowerCase() === String(data.user.username || '').toLowerCase()
                 );
+                const submittedPassword =
+                  typeof reqBodyObj.password === 'string' ? reqBodyObj.password.trim() : '';
+                const computedPwDigest = submittedPassword
+                  ? await sha256Hex(submittedPassword)
+                  : '';
+                const computedRecDigest =
+                  typeof data.recoveryCode === 'string' && data.recoveryCode
+                    ? await sha256Hex(data.recoveryCode.trim().toUpperCase())
+                    : '';
+
                 const now = new Date().toISOString();
                 const uObj: StoredUser = {
                   id: data.user.id,
                   fullName: data.user.fullName || '',
                   username: String(data.user.username || '').toLowerCase(),
-                  email: String(data.user.email || '').toLowerCase(),
-                  passwordDigest: existingIdx >= 0 ? st.users[existingIdx].passwordDigest : '',
-                  recoveryDigest: existingIdx >= 0 ? st.users[existingIdx].recoveryDigest : '',
+                  email: String(
+                    data.user.email ||
+                      (typeof reqBodyObj.email === 'string' ? reqBodyObj.email : '') ||
+                      (existingIdx >= 0 ? st.users[existingIdx].email : '')
+                  ).toLowerCase(),
+                  passwordDigest:
+                    computedPwDigest ||
+                    (existingIdx >= 0 ? st.users[existingIdx].passwordDigest : ''),
+                  recoveryDigest:
+                    computedRecDigest ||
+                    (existingIdx >= 0 ? st.users[existingIdx].recoveryDigest : ''),
                   bio: data.user.bio || '',
                   avatarUrl: data.user.avatarUrl || '',
                   createdAt: data.user.createdAt || now,
@@ -471,7 +533,18 @@ export function installServerlessFallbackInterceptor() {
             .catch(() => {});
         }
 
-        // If backend returned 401 on a cold serverless instance, verify against Firebase cloud fallback before failing
+        // If backend returned 401 on login or recover, check client cloud fallback in case the account was created on another static/mobile instance
+        if (
+          response.status === 401 &&
+          (urlStr.startsWith('/api/auth/login') || urlStr.startsWith('/api/auth/recover'))
+        ) {
+          const fallbackAuthRes = await handleFallbackApiRequest(urlStr, nextInit);
+          if (fallbackAuthRes.ok) {
+            return fallbackAuthRes;
+          }
+        }
+
+        // If backend returned 401 on an authenticated route on a cold serverless instance, verify against Firebase cloud fallback before failing
         if (
           response.status === 401 &&
           !urlStr.startsWith('/api/auth/login') &&
@@ -627,7 +700,7 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     }
 
     const recoveryCode = generateClientRecoveryCode();
-    const passwordDigest = await sha256Hex(password);
+    const passwordDigest = await sha256Hex(password.trim());
     const recoveryDigest = await sha256Hex(recoveryCode);
     const now = new Date().toISOString();
 
@@ -670,12 +743,29 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   // 2. Login
   if (pathname === '/api/auth/login' && method === 'POST') {
     const { identifier, password } = bodyObj;
-    const cleanId = String(identifier || '').trim().toLowerCase();
-    const pwDigest = await sha256Hex(String(password || ''));
-    const user = state.users.find(
-      (u) => u.username.toLowerCase() === cleanId || u.email.toLowerCase() === cleanId
-    );
-    if (!user || user.passwordDigest !== pwDigest) {
+    const cleanId = String(identifier || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '');
+    const rawPw = String(password || '');
+    const pwCandidates = await Promise.all([
+      sha256Hex(rawPw),
+      sha256Hex(rawPw.trim()),
+      sha256Hex(rawPw.trim().toLowerCase()),
+      sha256Hex(rawPw.trim().toUpperCase()),
+    ]);
+    const user = state.users.find((u) => {
+      const uname = u.username.toLowerCase();
+      const uemail = (u.email || '').toLowerCase();
+      const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
+      return (
+        uname === cleanId ||
+        uemail === cleanId ||
+        uemail === `${cleanId}@gmail.com` ||
+        (emailPrefix && emailPrefix === cleanId)
+      );
+    });
+    if (!user || !pwCandidates.includes(user.passwordDigest)) {
       return jsonResponse(401, { error: 'Incorrect username/Gmail or password.' });
     }
     user.lastSeen = new Date().toISOString();
@@ -692,15 +782,26 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   // 3. Recover
   if (pathname === '/api/auth/recover' && method === 'POST') {
     const { identifier, recoveryCode, newPassword } = bodyObj;
-    const cleanId = String(identifier || '').trim().toLowerCase();
+    const cleanId = String(identifier || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '');
     const recDigest = await sha256Hex(String(recoveryCode || '').trim().toUpperCase());
-    const user = state.users.find(
-      (u) => u.username.toLowerCase() === cleanId || u.email.toLowerCase() === cleanId
-    );
+    const user = state.users.find((u) => {
+      const uname = u.username.toLowerCase();
+      const uemail = (u.email || '').toLowerCase();
+      const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
+      return (
+        uname === cleanId ||
+        uemail === cleanId ||
+        uemail === `${cleanId}@gmail.com` ||
+        (emailPrefix && emailPrefix === cleanId)
+      );
+    });
     if (!user || user.recoveryDigest !== recDigest) {
       return jsonResponse(401, { error: 'Invalid account identifier or recovery code.' });
     }
-    user.passwordDigest = await sha256Hex(String(newPassword));
+    user.passwordDigest = await sha256Hex(String(newPassword).trim());
     await writeCloudState(state);
     return jsonResponse(200, { message: 'Password updated! You can now log in.' });
   }
@@ -775,7 +876,8 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   if (pathname === '/api/users/search' && method === 'GET') {
     const rawQ = (url.searchParams.get('q') || '').trim().toLowerCase();
     const normQ = rawQ.startsWith('@') ? rawQ.slice(1).trim() : rawQ;
-    const found = state.users.find((u) => {
+    let found = state.users.find((u) => {
+      if (u.id === currentUser.id) return false;
       const uname = (u.username || '').trim().toLowerCase();
       const uemail = (u.email || '').trim().toLowerCase();
       const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
@@ -786,11 +888,51 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
         (emailPrefix && emailPrefix === normQ)
       );
     });
-    if (!found) return jsonResponse(200, { result: null });
-    if (found.id === currentUser.id) {
-      return jsonResponse(400, { error: 'You cannot start a conversation with yourself.' });
+    if (!found) {
+      found = state.users.find((u) => {
+        if (u.id === currentUser.id) return false;
+        const uname = (u.username || '').trim().toLowerCase();
+        const uemail = (u.email || '').trim().toLowerCase();
+        const fname = (u.fullName || '').trim().toLowerCase();
+        return (
+          uname.includes(normQ) ||
+          normQ.includes(uname) ||
+          uemail.includes(normQ) ||
+          fname === normQ ||
+          fname.includes(normQ)
+        );
+      });
     }
-    return jsonResponse(200, { result: toUserProfile(found, currentUser.id, state) });
+    const matchingUsers = state.users
+      .filter((u) => {
+        if (u.id === currentUser.id) return false;
+        const uname = (u.username || '').trim().toLowerCase();
+        const uemail = (u.email || '').trim().toLowerCase();
+        const fname = (u.fullName || '').trim().toLowerCase();
+        return (
+          uname.includes(normQ) ||
+          normQ.includes(uname) ||
+          uemail.includes(normQ) ||
+          fname.includes(normQ)
+        );
+      })
+      .map((u) => toUserProfile(u, currentUser.id, state));
+
+    if (!found) {
+      const isSelfSearch =
+        currentUser.username.toLowerCase() === normQ ||
+        (currentUser.email && currentUser.email.toLowerCase() === normQ);
+      if (isSelfSearch) {
+        return jsonResponse(400, {
+          error: 'This is your own account! Enter the other person’s username or Gmail to connect.',
+        });
+      }
+      return jsonResponse(200, { result: null, results: [] });
+    }
+    return jsonResponse(200, {
+      result: toUserProfile(found, currentUser.id, state),
+      results: matchingUsers,
+    });
   }
 
   // Contacts
@@ -821,8 +963,35 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   }
 
   if (pathname === '/api/contacts/add' && method === 'POST') {
-    const { targetUserId } = bodyObj;
-    const target = state.users.find((u) => u.id === targetUserId);
+    const { targetUserId, targetUser } = bodyObj;
+    let target = state.users.find((u) => u.id === targetUserId);
+    if (!target && targetUser && targetUser.id && targetUser.username) {
+      const now = new Date().toISOString();
+      target = {
+        id: String(targetUser.id),
+        fullName: String(targetUser.fullName || targetUser.username),
+        username: String(targetUser.username).toLowerCase(),
+        email: String(targetUser.email || `${targetUser.username}@gmail.com`).toLowerCase(),
+        passwordDigest: '',
+        recoveryDigest: '',
+        bio: String(targetUser.bio || ''),
+        avatarUrl: String(targetUser.avatarUrl || ''),
+        createdAt: now,
+        lastSeen: now,
+        isOnline: Boolean(targetUser.isOnline),
+        usernameChangeTimestamps: [],
+        privacy: {
+          profilePicVisibility: 'everyone',
+          lastSeenVisibility: 'everyone',
+          readReceipts: true,
+          statusPrivacy: 'everyone',
+          whoCanContact: 'everyone',
+        },
+        notifications: { messageAlerts: true, soundEnabled: true, previewText: true },
+        chatSettings: { enterToSend: true, fontSize: 'medium', autoDownloadImages: true },
+      };
+      state.users.push(target);
+    }
     if (!target) return jsonResponse(404, { error: 'User not found.' });
     if (
       !state.contacts.some(
@@ -920,8 +1089,35 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
   }
 
   if (pathname === '/api/conversations/start' && method === 'POST') {
-    const { recipientId } = bodyObj;
-    const recipient = state.users.find((u) => u.id === recipientId);
+    const { recipientId, targetUser } = bodyObj;
+    let recipient = state.users.find((u) => u.id === recipientId);
+    if (!recipient && targetUser && targetUser.id && targetUser.username) {
+      const now = new Date().toISOString();
+      recipient = {
+        id: String(targetUser.id),
+        fullName: String(targetUser.fullName || targetUser.username),
+        username: String(targetUser.username).toLowerCase(),
+        email: String(targetUser.email || `${targetUser.username}@gmail.com`).toLowerCase(),
+        passwordDigest: '',
+        recoveryDigest: '',
+        bio: String(targetUser.bio || ''),
+        avatarUrl: String(targetUser.avatarUrl || ''),
+        createdAt: now,
+        lastSeen: now,
+        isOnline: Boolean(targetUser.isOnline),
+        usernameChangeTimestamps: [],
+        privacy: {
+          profilePicVisibility: 'everyone',
+          lastSeenVisibility: 'everyone',
+          readReceipts: true,
+          statusPrivacy: 'everyone',
+          whoCanContact: 'everyone',
+        },
+        notifications: { messageAlerts: true, soundEnabled: true, previewText: true },
+        chatSettings: { enterToSend: true, fontSize: 'medium', autoDownloadImages: true },
+      };
+      state.users.push(recipient);
+    }
     if (!recipient) return jsonResponse(404, { error: 'No user found.' });
     let conv = state.conversations.find(
       (c) =>

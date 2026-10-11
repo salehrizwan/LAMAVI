@@ -560,7 +560,7 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ recipientId: targetUser.id }),
+        body: JSON.stringify({ recipientId: targetUser.id, targetUser }),
       });
       const data = await res.json();
       if (res.ok && data.conversation) {
@@ -581,7 +581,7 @@ export default function App() {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ targetUserId: targetUser.id }),
+      body: JSON.stringify({ targetUserId: targetUser.id, targetUser }),
     });
     fetchAllData();
   };

@@ -247,6 +247,7 @@ function loadLocalDatabase(): DatabaseSchema {
 export let db: DatabaseSchema = loadLocalDatabase();
 
 const FIRESTORE_DOC_URL = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/lamavi_public/app_state?key=${firebaseConfig.apiKey}`;
+const FIRESTORE_MEDIA_URL = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/lamavi_public/app_media?key=${firebaseConfig.apiKey}`;
 
 function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>): DatabaseSchema {
   const userMap = new Map<string, UserRecord>();
@@ -258,33 +259,48 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
     const key = (u.username || '').toLowerCase();
     if (!key) continue;
     const existing = userMap.get(key);
+    const incomingSalt =
+      u.passwordSalt ||
+      (u.passwordDigest && u.passwordDigest.length === 64 ? 'sha256_client' : 'sha256_client');
+    const incomingHash = u.passwordHash || u.passwordDigest || '';
+    const incomingRecSalt =
+      u.recoveryCodeSalt ||
+      (u.recoveryDigest && u.recoveryDigest.length === 64 ? 'sha256_client' : 'sha256_client');
+    const incomingRecHash = u.recoveryCodeHash || u.recoveryDigest || '';
+
     if (!existing) {
       userMap.set(key, {
         ...u,
-        passwordSalt: u.passwordSalt || 'sha256_client',
-        passwordHash: u.passwordHash || u.passwordDigest || '',
-        recoveryCodeSalt: u.recoveryCodeSalt || 'sha256_client',
-        recoveryCodeHash: u.recoveryCodeHash || u.recoveryDigest || '',
+        passwordSalt: incomingSalt,
+        passwordHash: incomingHash,
+        recoveryCodeSalt: incomingRecSalt,
+        recoveryCodeHash: incomingRecHash,
         usernameChangeTimestamps: u.usernameChangeTimestamps || [],
       });
     } else {
-      // Keep the most recently updated profile fields (avatar, bio, fullName, lastSeen)
+      // Keep the most recently updated profile fields (avatar, bio, fullName, lastSeen) and latest credentials
       const incomingTime = u.lastSeen || u.createdAt || '';
       const existingTime = existing.lastSeen || existing.createdAt || '';
-      if (incomingTime >= existingTime || (u.avatarUrl && !existing.avatarUrl) || (u.bio && !existing.bio)) {
-        userMap.set(key, {
-          ...existing,
-          ...u,
-          id: existing.id,
-          avatarUrl: u.avatarUrl || existing.avatarUrl,
-          bio: u.bio || existing.bio,
-          fullName: u.fullName || existing.fullName,
-          passwordSalt: existing.passwordSalt || u.passwordSalt || 'sha256_client',
-          passwordHash: existing.passwordHash || u.passwordHash || u.passwordDigest || '',
-          recoveryCodeSalt: existing.recoveryCodeSalt || u.recoveryCodeSalt || 'sha256_client',
-          recoveryCodeHash: existing.recoveryCodeHash || u.recoveryCodeHash || u.recoveryDigest || '',
-        });
-      }
+      const preferIncoming = incomingTime >= existingTime;
+      userMap.set(key, {
+        ...existing,
+        ...(preferIncoming ? u : {}),
+        id: existing.id,
+        avatarUrl: (preferIncoming && u.avatarUrl ? u.avatarUrl : existing.avatarUrl) || u.avatarUrl || '',
+        bio: (preferIncoming && u.bio !== undefined ? u.bio : existing.bio) || u.bio || '',
+        fullName: (preferIncoming && u.fullName ? u.fullName : existing.fullName) || u.fullName || '',
+        email: (preferIncoming && u.email ? u.email : existing.email) || u.email || '',
+        passwordSalt:
+          (preferIncoming && incomingHash ? incomingSalt : existing.passwordSalt) || incomingSalt,
+        passwordHash:
+          (preferIncoming && incomingHash ? incomingHash : existing.passwordHash) || incomingHash,
+        recoveryCodeSalt:
+          (preferIncoming && incomingRecHash ? incomingRecSalt : existing.recoveryCodeSalt) ||
+          incomingRecSalt,
+        recoveryCodeHash:
+          (preferIncoming && incomingRecHash ? incomingRecHash : existing.recoveryCodeHash) ||
+          incomingRecHash,
+      });
     }
   }
 
@@ -355,6 +371,21 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
     }
   }
 
+  const blockKeySet = new Set<string>();
+  const mergedBlocks: BlockRecord[] = [];
+  for (const bl of [...(base.blocks || []), ...(incoming.blocks || [])]) {
+    const key = `${bl.blockerId}:${bl.blockedUserId}`;
+    if (!blockKeySet.has(key)) {
+      blockKeySet.add(key);
+      mergedBlocks.push({
+        id: bl.id || `blk_${crypto.randomBytes(6).toString('hex')}`,
+        blockerId: bl.blockerId,
+        blockedUserId: bl.blockedUserId,
+        createdAt: bl.createdAt || new Date().toISOString(),
+      });
+    }
+  }
+
   return cleanParsedDatabase({
     users: Array.from(userMap.values()),
     sessions: Array.from(sessionMap.values()),
@@ -363,7 +394,7 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
     media: Array.from(mediaMap.values()),
     statuses: Array.from(statusMap.values()),
     statusViews: base.statusViews || [],
-    blocks: base.blocks || [],
+    blocks: mergedBlocks,
     reports: base.reports || [],
     contacts: mergedContacts,
   });
@@ -374,16 +405,29 @@ let lastCloudSyncMs = 0;
 // Sync state from Firestore Cloud so AI Studio, Vercel, Laptop & Mobile share all accounts & messages
 export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
   const now = Date.now();
-  if (!force && now - lastCloudSyncMs < 2500) return;
+  if (!force && now - lastCloudSyncMs < 2000) return;
   lastCloudSyncMs = now;
   try {
-    const res = await fetch(FIRESTORE_DOC_URL);
-    if (res.ok) {
-      const docData = await res.json();
+    const [resState, resMedia] = await Promise.all([
+      fetch(FIRESTORE_DOC_URL).catch(() => null),
+      fetch(FIRESTORE_MEDIA_URL).catch(() => null),
+    ]);
+    if (resState && resState.ok) {
+      const docData = await resState.json();
       const rawJson = docData?.fields?.stateJson?.stringValue;
       if (typeof rawJson === 'string') {
         const parsed = JSON.parse(rawJson) as Partial<DatabaseSchema>;
         db = mergeDatabases(db, parsed);
+      }
+    }
+    if (resMedia && resMedia.ok) {
+      const mediaDoc = await resMedia.json();
+      const rawMediaJson = mediaDoc?.fields?.stateJson?.stringValue;
+      if (typeof rawMediaJson === 'string') {
+        const parsedMedia = JSON.parse(rawMediaJson) as Partial<DatabaseSchema>;
+        if (Array.isArray(parsedMedia.media)) {
+          db = mergeDatabases(db, { media: parsedMedia.media });
+        }
       }
     }
   } catch {
@@ -403,19 +447,31 @@ export async function saveDatabase(data: DatabaseSchema = db): Promise<void> {
     // Ignore read-only filesystem errors on serverless
   }
 
-  // Persist to Firebase Firestore `/lamavi_public/app_state` so all devices & serverless instances see updates immediately
+  // Persist users, sessions, conversations, messages, statuses, contacts to `/lamavi_public/app_state` (without heavy base64 media) so it ALWAYS stays well under Firestore's 1MB document limit!
   try {
     const sessionsMap: Record<string, string> = {};
     for (const s of data.sessions) {
       sessionsMap[s.token] = s.userId;
     }
-    const lightCopy = {
-      ...data,
+    const usersWithDigests = data.users.map((u) => ({
+      ...u,
+      passwordDigest: u.passwordHash,
+      recoveryDigest: u.recoveryCodeHash,
+    }));
+    const coreCopy = {
+      users: usersWithDigests,
+      sessions: data.sessions.slice(-200),
       sessionsMap,
-      media: data.media.slice(-8),
+      conversations: data.conversations,
+      messages: data.messages.slice(-500),
+      statuses: data.statuses,
+      statusViews: data.statusViews,
+      blocks: data.blocks,
+      contacts: data.contacts,
+      media: [], // Kept in app_media document so core user/account sync never exceeds 950KB
     };
-    const serialized = JSON.stringify(lightCopy);
-    if (serialized.length < 950000) {
+    const serializedCore = JSON.stringify(coreCopy);
+    if (serializedCore.length < 950000) {
       await fetch(FIRESTORE_DOC_URL, {
         method: 'PATCH',
         headers: {
@@ -423,18 +479,42 @@ export async function saveDatabase(data: DatabaseSchema = db): Promise<void> {
         },
         body: JSON.stringify({
           fields: {
-            stateJson: { stringValue: serialized },
+            stateJson: { stringValue: serializedCore },
             updatedAt: { stringValue: new Date().toISOString() },
           },
         }),
       }).catch(() => {});
     }
+
+    // Separately persist recent compact media items that fit under 850KB to `/lamavi_public/app_media`
+    const fittingMedia: MediaRecord[] = [];
+    let currentLen = 20;
+    for (let i = data.media.length - 1; i >= 0; i--) {
+      const itemStr = JSON.stringify(data.media[i]);
+      if (currentLen + itemStr.length < 850000) {
+        fittingMedia.unshift(data.media[i]);
+        currentLen += itemStr.length + 2;
+      }
+    }
+    const serializedMedia = JSON.stringify({ media: fittingMedia });
+    await fetch(FIRESTORE_MEDIA_URL, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        fields: {
+          stateJson: { stringValue: serializedMedia },
+          updatedAt: { stringValue: new Date().toISOString() },
+        },
+      }),
+    }).catch(() => {});
   } catch {
     // Ignore serialization error
   }
 }
 
-// Seed cloud store on startup so existing local accounts (`saleh123`, `ahmad123`, etc.) are immediately in Firestore
+// Seed cloud store on startup so existing local accounts (`saleh123`, `ahmad123`, `saleh1234`, etc.) are immediately in Firestore
 ensureCloudDatabaseLoaded(true).then(() => {
   saveDatabase(db);
 });
@@ -443,7 +523,12 @@ function hashSecret(
   secret: string,
   salt?: string
 ): { salt: string; hash: string } {
-  const actualSalt = salt || crypto.randomBytes(16).toString('hex');
+  // Use deterministic SHA-256 when salt is 'sha256_client' so both browser WebCrypto and Node backend verify identically across all devices!
+  const actualSalt = salt || 'sha256_client';
+  if (actualSalt === 'sha256_client') {
+    const hash = crypto.createHash('sha256').update(secret).digest('hex');
+    return { salt: 'sha256_client', hash };
+  }
   const hash = crypto.scryptSync(secret, actualSalt, 64).toString('hex');
   return { salt: actualSalt, hash };
 }
@@ -453,16 +538,37 @@ function verifySecret(
   salt: string,
   expectedHash: string
 ): boolean {
-  if (!expectedHash) return false;
-  if (salt === 'sha256_client') {
-    const sha = crypto.createHash('sha256').update(secret).digest('hex');
-    return sha === expectedHash;
+  if (!expectedHash || typeof secret !== 'string') return false;
+  const candidates = [
+    secret,
+    secret.trim(),
+    secret.trim().toLowerCase(),
+    secret.trim().toUpperCase(),
+  ];
+
+  for (const candidate of candidates) {
+    // 1. Check SHA-256 hex digest (used by client fallback & new unified accounts)
+    const sha = crypto.createHash('sha256').update(candidate).digest('hex');
+    if (sha === expectedHash) return true;
+
+    // 2. Check legacy scrypt hash if salt is a hex salt
+    if (salt && salt !== 'sha256_client' && expectedHash.length === 128) {
+      try {
+        const scryptHash = crypto.scryptSync(candidate, salt, 64).toString('hex');
+        if (
+          crypto.timingSafeEqual(
+            Buffer.from(scryptHash, 'hex'),
+            Buffer.from(expectedHash, 'hex')
+          )
+        ) {
+          return true;
+        }
+      } catch {
+        // ignore buffer mismatch
+      }
+    }
   }
-  const { hash } = hashSecret(secret, salt);
-  return crypto.timingSafeEqual(
-    Buffer.from(hash, 'hex'),
-    Buffer.from(expectedHash, 'hex')
-  );
+  return false;
 }
 
 function generateRecoveryCode(): string {
@@ -892,12 +998,18 @@ export function createApiApp(
       return;
     }
 
-    const cleanId = identifier.trim().toLowerCase();
-    const user = db.users.find(
-      (u) =>
-        u.username.toLowerCase() === cleanId ||
-        (u.email && u.email.toLowerCase() === cleanId)
-    );
+    const cleanId = identifier.trim().toLowerCase().replace(/^@/, '');
+    const user = db.users.find((u) => {
+      const uname = u.username.toLowerCase();
+      const uemail = (u.email || '').toLowerCase();
+      const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
+      return (
+        uname === cleanId ||
+        uemail === cleanId ||
+        uemail === `${cleanId}@gmail.com` ||
+        (emailPrefix && emailPrefix === cleanId)
+      );
+    });
 
     if (
       !user ||
@@ -907,6 +1019,13 @@ export function createApiApp(
         .status(401)
         .json({ error: 'Incorrect username/email or password.' });
       return;
+    }
+
+    // Upgrade legacy scrypt hash to deterministic SHA-256 on successful login so cross-device fallback also verifies it
+    if (user.passwordSalt !== 'sha256_client') {
+      const upgraded = hashSecret(password.trim(), 'sha256_client');
+      user.passwordSalt = upgraded.salt;
+      user.passwordHash = upgraded.hash;
     }
 
     const now = new Date().toISOString();
@@ -1189,7 +1308,9 @@ export function createApiApp(
       ? rawQuery.slice(1).trim()
       : rawQuery;
 
-    const found = db.users.find((u) => {
+    // 1. Exact match on username, email, or Gmail prefix first
+    let found = db.users.find((u) => {
+      if (u.id === user.id) return false;
       const uname = (u.username || '').trim().toLowerCase();
       const uemail = (u.email || '').trim().toLowerCase();
       const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
@@ -1201,21 +1322,67 @@ export function createApiApp(
       );
     });
 
+    // 2. If no exact match, check partial/prefix match on username, email, or fullName so users never get stuck with "No user found"
     if (!found) {
-      res.json({ result: null });
-      return;
+      found = db.users.find((u) => {
+        if (u.id === user.id) return false;
+        const uname = (u.username || '').trim().toLowerCase();
+        const uemail = (u.email || '').trim().toLowerCase();
+        const fname = (u.fullName || '').trim().toLowerCase();
+        return (
+          uname.includes(normalizedQuery) ||
+          normalizedQuery.includes(uname) ||
+          uemail.includes(normalizedQuery) ||
+          fname === normalizedQuery ||
+          fname.includes(normalizedQuery)
+        );
+      });
     }
 
-    if (found.id === user.id) {
-      res
-        .status(400)
-        .json({ error: 'You cannot start a conversation with yourself.' });
+    // Also collect all matching users so the search modal can show multiple matches if applicable
+    const matchingUsers = db.users
+      .filter((u) => {
+        if (u.id === user.id) return false;
+        const { blockedByThem } = isBlockedBetween(user.id, u.id);
+        if (blockedByThem) return false;
+        const uname = (u.username || '').trim().toLowerCase();
+        const uemail = (u.email || '').trim().toLowerCase();
+        const fname = (u.fullName || '').trim().toLowerCase();
+        return (
+          uname.includes(normalizedQuery) ||
+          normalizedQuery.includes(uname) ||
+          uemail.includes(normalizedQuery) ||
+          fname.includes(normalizedQuery)
+        );
+      })
+      .map((u) => ({
+        ...sanitizeUserForViewer(u, user.id),
+        isContact: db.contacts.some(
+          (c) => c.userId === user.id && c.contactUserId === u.id
+        ),
+        isBlocked: db.blocks.some(
+          (b) => b.blockerId === user.id && b.blockedUserId === u.id
+        ),
+      }));
+
+    if (!found) {
+      // Check if they searched their own username/email
+      const isSelfSearch =
+        user.username.toLowerCase() === normalizedQuery ||
+        (user.email && user.email.toLowerCase() === normalizedQuery);
+      if (isSelfSearch) {
+        res
+          .status(400)
+          .json({ error: 'This is your own account! Enter the other person’s username or Gmail to connect.' });
+        return;
+      }
+      res.json({ result: null, results: [] });
       return;
     }
 
     const { blockedByThem } = isBlockedBetween(user.id, found.id);
     if (blockedByThem) {
-      res.json({ result: null });
+      res.json({ result: null, results: [] });
       return;
     }
 
@@ -1233,11 +1400,13 @@ export function createApiApp(
         isContact,
         isBlocked,
       },
+      results: matchingUsers,
     });
   });
 
   // --- CONTACTS, BLOCKING, AND REPORTING ---
-  app.get('/api/contacts', requireAuth, (req, res) => {
+  app.get('/api/contacts', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded();
     const user = (req as express.Request & { user: UserRecord }).user;
 
     const contactUserIds = new Set<string>();
@@ -1277,15 +1446,53 @@ export function createApiApp(
   });
 
   app.post('/api/contacts/add', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
-    const { targetUserId } = req.body || {};
+    const { targetUserId, targetUser } = req.body || {};
 
     if (!targetUserId || targetUserId === user.id) {
       res.status(400).json({ error: 'Invalid user selected.' });
       return;
     }
 
-    const target = db.users.find((u) => u.id === targetUserId);
+    let target = db.users.find((u) => u.id === targetUserId);
+    if (!target && targetUser && targetUser.id && targetUser.username) {
+      const now = new Date().toISOString();
+      target = {
+        id: String(targetUser.id),
+        fullName: String(targetUser.fullName || targetUser.username),
+        username: String(targetUser.username).toLowerCase(),
+        email: String(targetUser.email || `${targetUser.username}@gmail.com`).toLowerCase(),
+        passwordSalt: 'sha256_client',
+        passwordHash: '',
+        recoveryCodeSalt: 'sha256_client',
+        recoveryCodeHash: '',
+        bio: String(targetUser.bio || ''),
+        avatarUrl: String(targetUser.avatarUrl || ''),
+        createdAt: now,
+        lastSeen: now,
+        isOnline: Boolean(targetUser.isOnline),
+        usernameChangeTimestamps: [],
+        privacy: {
+          profilePicVisibility: 'everyone',
+          lastSeenVisibility: 'everyone',
+          readReceipts: true,
+          statusPrivacy: 'everyone',
+          whoCanContact: 'everyone',
+        },
+        notifications: {
+          messageAlerts: true,
+          soundEnabled: true,
+          previewText: true,
+        },
+        chatSettings: {
+          enterToSend: true,
+          fontSize: 'medium',
+          autoDownloadImages: true,
+        },
+      };
+      db.users.push(target);
+    }
     if (!target) {
       res.status(404).json({ error: 'User not found.' });
       return;
@@ -1592,8 +1799,9 @@ export function createApiApp(
   });
 
   app.post('/api/conversations/start', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
-    const { recipientId } = req.body || {};
+    const { recipientId, targetUser } = req.body || {};
 
     if (!recipientId || typeof recipientId !== 'string') {
       res.status(400).json({ error: 'Recipient user ID is required.' });
@@ -1605,7 +1813,44 @@ export function createApiApp(
       return;
     }
 
-    const recipient = db.users.find((u) => u.id === recipientId);
+    let recipient = db.users.find((u) => u.id === recipientId);
+    if (!recipient && targetUser && targetUser.id && targetUser.username) {
+      const now = new Date().toISOString();
+      recipient = {
+        id: String(targetUser.id),
+        fullName: String(targetUser.fullName || targetUser.username),
+        username: String(targetUser.username).toLowerCase(),
+        email: String(targetUser.email || `${targetUser.username}@gmail.com`).toLowerCase(),
+        passwordSalt: 'sha256_client',
+        passwordHash: '',
+        recoveryCodeSalt: 'sha256_client',
+        recoveryCodeHash: '',
+        bio: String(targetUser.bio || ''),
+        avatarUrl: String(targetUser.avatarUrl || ''),
+        createdAt: now,
+        lastSeen: now,
+        isOnline: Boolean(targetUser.isOnline),
+        usernameChangeTimestamps: [],
+        privacy: {
+          profilePicVisibility: 'everyone',
+          lastSeenVisibility: 'everyone',
+          readReceipts: true,
+          statusPrivacy: 'everyone',
+          whoCanContact: 'everyone',
+        },
+        notifications: {
+          messageAlerts: true,
+          soundEnabled: true,
+          previewText: true,
+        },
+        chatSettings: {
+          enterToSend: true,
+          fontSize: 'medium',
+          autoDownloadImages: true,
+        },
+      };
+      db.users.push(recipient);
+    }
     if (!recipient) {
       res.status(404).json({ error: 'No user found.' });
       return;

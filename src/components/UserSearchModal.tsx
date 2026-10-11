@@ -24,8 +24,9 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [result, setResult] = useState<UserProfile | null>(null);
+  const [results, setResults] = useState<UserProfile[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [addedContact, setAddedContact] = useState(false);
+  const [addedContactIds, setAddedContactIds] = useState<Record<string, boolean>>({});
   const [fullScreenDp, setFullScreenDp] = useState<{ src: string; caption?: string } | null>(null);
 
   const handleSearch = async (e: React.FormEvent) => {
@@ -42,7 +43,7 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
     setErrorMsg(null);
     setSearched(false);
     setResult(null);
-    setAddedContact(false);
+    setResults([]);
 
     try {
       const res = await fetch(`/api/users/search?q=${encodeURIComponent(targetQuery)}`, {
@@ -53,6 +54,7 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
         setErrorMsg(data.error || 'Could not complete search.');
       } else {
         setResult(data.result || null);
+        setResults(Array.isArray(data.results) ? data.results : data.result ? [data.result] : []);
         setSearched(true);
       }
     } catch {
@@ -64,8 +66,8 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4">
-      <div className="w-full max-w-md rounded-3xl bg-white border border-[#E5E5EA] shadow-xl overflow-hidden">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-[#E5E5EA]">
+      <div className="w-full max-w-md max-h-[90vh] flex flex-col rounded-3xl bg-white border border-[#E5E5EA] shadow-xl overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-[#E5E5EA] shrink-0">
           <h3 className="font-display text-base font-semibold text-[#1C1C1E]">Find User on LAMAVI</h3>
           <button
             onClick={onClose}
@@ -75,10 +77,11 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
           </button>
         </div>
 
-        <div className="p-5">
+        <div className="p-5 overflow-y-auto">
           <p className="text-xs text-[#636366] mb-3 leading-relaxed">
-            Enter an exact <strong className="text-[#1C1C1E]">username</strong> or registered{' '}
-            <strong className="text-[#1C1C1E]">Gmail address</strong> to view their profile and connect.
+            Enter a <strong className="text-[#1C1C1E]">username</strong>,{' '}
+            <strong className="text-[#1C1C1E]">Gmail address</strong>, or{' '}
+            <strong className="text-[#1C1C1E]">name</strong> to view their profile and start chatting.
           </p>
 
           <form onSubmit={handleSearch} className="flex items-center gap-2">
@@ -88,7 +91,7 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Username or Gmail..."
+                placeholder="Username, Gmail, or name..."
                 autoFocus
                 className="w-full h-11 pl-10 pr-4 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none"
               />
@@ -116,11 +119,11 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
             </div>
           )}
 
-          {searched && !result && !errorMsg && (
+          {searched && !result && results.length === 0 && !errorMsg && (
             <div className="mt-5 py-8 px-4 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA] text-center">
               <p className="text-sm font-medium text-[#1C1C1E]">No user found</p>
               <p className="text-xs text-[#636366] mt-1">
-                No registered LAMAVI account matches that exact username or Gmail address.
+                No registered LAMAVI account matches that username or Gmail address.
               </p>
             </div>
           )}
@@ -183,13 +186,13 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
                   <MessageSquare className="w-4 h-4" />
                   <span>Message</span>
                 </button>
-                {onAddContact && !result.isContact && !addedContact && (
+                {onAddContact && !result.isContact && !addedContactIds[result.id] && (
                   <button
                     type="button"
                     disabled={!isOnline}
                     onClick={() => {
                       onAddContact(result);
-                      setAddedContact(true);
+                      setAddedContactIds((prev) => ({ ...prev, [result.id]: true }));
                     }}
                     className="h-11 px-4 rounded-xl bg-white hover:bg-[#F2F2F7] disabled:opacity-40 border border-[#D1D1D6] text-xs font-semibold text-[#1C1C1E] flex items-center justify-center gap-1.5 transition-colors"
                   >
@@ -197,13 +200,47 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
                     <span>Connect</span>
                   </button>
                 )}
-                {(result.isContact || addedContact) && (
+                {(result.isContact || addedContactIds[result.id]) && (
                   <div className="h-11 px-3.5 rounded-xl bg-white border border-[#E5E5EA] text-xs font-medium text-[#15803D] flex items-center gap-1.5">
                     <Check className="w-4 h-4" />
                     <span>Connected</span>
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {results.length > 1 && (
+            <div className="mt-4 space-y-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-[#8E8E93] px-1">
+                Other Matching Accounts ({results.length - 1})
+              </p>
+              {results
+                .filter((u) => u.id !== result?.id)
+                .map((u) => (
+                  <div
+                    key={u.id}
+                    className="p-3 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA] flex items-center justify-between gap-3"
+                  >
+                    <div
+                      onClick={() => setResult(u)}
+                      className="flex items-center gap-2.5 min-w-0 cursor-pointer"
+                    >
+                      <Avatar src={u.avatarUrl} name={u.fullName} size="sm" isOnline={u.isOnline} showPresence />
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-[#1C1C1E] truncate">{u.fullName}</p>
+                        <p className="text-[11px] text-[#636366] truncate">@{u.username}</p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onStartConversation(u)}
+                      className="h-8 px-3 rounded-xl bg-[#2C2C2E] text-white text-[11px] font-semibold shrink-0 hover:bg-[#3A3A3C]"
+                    >
+                      Message
+                    </button>
+                  </div>
+                ))}
             </div>
           )}
         </div>

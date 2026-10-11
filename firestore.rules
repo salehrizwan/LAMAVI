@@ -116,10 +116,10 @@ service cloud.firestore {
 
     // 0. Cross-Device Serverless State Sync
     match /lamavi_public/{docId} {
-      allow get: if isValidId(docId) && docId == 'app_state';
+      allow get: if isValidId(docId) && (docId == 'app_state' || docId == 'app_media');
       allow list: if false;
-      allow create: if isValidId(docId) && docId == 'app_state' && isValidAppSync(incoming());
-      allow update: if isValidId(docId) && docId == 'app_state' && isValidAppSync(incoming())
+      allow create: if isValidId(docId) && (docId == 'app_state' || docId == 'app_media') && isValidAppSync(incoming());
+      allow update: if isValidId(docId) && (docId == 'app_state' || docId == 'app_media') && isValidAppSync(incoming())
         && incoming().diff(existing()).affectedKeys().hasOnly(['stateJson', 'updatedAt']);
       allow delete: if false;
     }
