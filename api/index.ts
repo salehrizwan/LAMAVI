@@ -401,41 +401,44 @@ function mergeDatabases(base: DatabaseSchema, incoming: Partial<DatabaseSchema>)
 }
 
 let lastCloudSyncMs = 0;
+let firestoreQuotaBackoffUntilMs = 0;
+export let lastFirestoreQuotaError: string | null = null;
+let saveDebounceTimer: NodeJS.Timeout | null = null;
 
-// Sync state from Firestore Cloud so AI Studio, Vercel, Laptop & Mobile share all accounts & messages
+// Sync state from Firestore Cloud with quota circuit-breaker protection
 export async function ensureCloudDatabaseLoaded(force = false): Promise<void> {
   const now = Date.now();
-  if (!force && now - lastCloudSyncMs < 2000) return;
+  if (now < firestoreQuotaBackoffUntilMs) {
+    return;
+  }
+  const minInterval = force ? 15000 : 45000;
+  if (now - lastCloudSyncMs < minInterval) return;
   lastCloudSyncMs = now;
   try {
-    const [resState, resMedia] = await Promise.all([
-      fetch(FIRESTORE_DOC_URL).catch(() => null),
-      fetch(FIRESTORE_MEDIA_URL).catch(() => null),
-    ]);
-    if (resState && resState.ok) {
-      const docData = await resState.json();
-      const rawJson = docData?.fields?.stateJson?.stringValue;
-      if (typeof rawJson === 'string') {
-        const parsed = JSON.parse(rawJson) as Partial<DatabaseSchema>;
-        db = mergeDatabases(db, parsed);
+    const resState = await fetch(FIRESTORE_DOC_URL).catch(() => null);
+    if (resState) {
+      if (resState.status === 429) {
+        firestoreQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000; // 10-min circuit breaker on 429 Quota Exceeded
+        lastFirestoreQuotaError =
+          'Firestore free daily quota (429 RESOURCE_EXHAUSTED) reached. Operating on persistent backend storage until daily quota resets at midnight Pacific Time.';
+        return;
       }
-    }
-    if (resMedia && resMedia.ok) {
-      const mediaDoc = await resMedia.json();
-      const rawMediaJson = mediaDoc?.fields?.stateJson?.stringValue;
-      if (typeof rawMediaJson === 'string') {
-        const parsedMedia = JSON.parse(rawMediaJson) as Partial<DatabaseSchema>;
-        if (Array.isArray(parsedMedia.media)) {
-          db = mergeDatabases(db, { media: parsedMedia.media });
+      if (resState.ok) {
+        lastFirestoreQuotaError = null;
+        const docData = await resState.json();
+        const rawJson = docData?.fields?.stateJson?.stringValue;
+        if (typeof rawJson === 'string') {
+          const parsed = JSON.parse(rawJson) as Partial<DatabaseSchema>;
+          db = mergeDatabases(db, parsed);
         }
       }
     }
   } catch {
-    // Fallback to local filesystem db seamlessly
+    // Fallback to local persistent database seamlessly
   }
 }
 
-export async function saveDatabase(data: DatabaseSchema = db): Promise<void> {
+export async function saveDatabase(data: DatabaseSchema = db, syncMedia = false): Promise<void> {
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -447,77 +450,94 @@ export async function saveDatabase(data: DatabaseSchema = db): Promise<void> {
     // Ignore read-only filesystem errors on serverless
   }
 
-  // Persist users, sessions, conversations, messages, statuses, contacts to `/lamavi_public/app_state` (without heavy base64 media) so it ALWAYS stays well under Firestore's 1MB document limit!
-  try {
-    const sessionsMap: Record<string, string> = {};
-    for (const s of data.sessions) {
-      sessionsMap[s.token] = s.userId;
-    }
-    const usersWithDigests = data.users.map((u) => ({
-      ...u,
-      passwordDigest: u.passwordHash,
-      recoveryDigest: u.recoveryCodeHash,
-    }));
-    const coreCopy = {
-      users: usersWithDigests,
-      sessions: data.sessions.slice(-200),
-      sessionsMap,
-      conversations: data.conversations,
-      messages: data.messages.slice(-500),
-      statuses: data.statuses,
-      statusViews: data.statusViews,
-      blocks: data.blocks,
-      contacts: data.contacts,
-      media: [], // Kept in app_media document so core user/account sync never exceeds 950KB
-    };
-    const serializedCore = JSON.stringify(coreCopy);
-    if (serializedCore.length < 950000) {
-      await fetch(FIRESTORE_DOC_URL, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          fields: {
-            stateJson: { stringValue: serializedCore },
-            updatedAt: { stringValue: new Date().toISOString() },
-          },
-        }),
-      }).catch(() => {});
-    }
-
-    // Separately persist recent compact media items that fit under 850KB to `/lamavi_public/app_media`
-    const fittingMedia: MediaRecord[] = [];
-    let currentLen = 20;
-    for (let i = data.media.length - 1; i >= 0; i--) {
-      const itemStr = JSON.stringify(data.media[i]);
-      if (currentLen + itemStr.length < 850000) {
-        fittingMedia.unshift(data.media[i]);
-        currentLen += itemStr.length + 2;
-      }
-    }
-    const serializedMedia = JSON.stringify({ media: fittingMedia });
-    await fetch(FIRESTORE_MEDIA_URL, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        fields: {
-          stateJson: { stringValue: serializedMedia },
-          updatedAt: { stringValue: new Date().toISOString() },
-        },
-      }),
-    }).catch(() => {});
-  } catch {
-    // Ignore serialization error
+  // Respect Firestore 429 quota circuit-breaker and debounce cloud syncs to prevent quota exhaustion
+  if (Date.now() < firestoreQuotaBackoffUntilMs) {
+    return;
   }
+
+  if (saveDebounceTimer) {
+    clearTimeout(saveDebounceTimer);
+  }
+
+  saveDebounceTimer = setTimeout(async () => {
+    if (Date.now() < firestoreQuotaBackoffUntilMs) return;
+    try {
+      const sessionsMap: Record<string, string> = {};
+      for (const s of data.sessions) {
+        sessionsMap[s.token] = s.userId;
+      }
+      const usersWithDigests = data.users.map((u) => ({
+        ...u,
+        passwordDigest: u.passwordHash,
+        recoveryDigest: u.recoveryCodeHash,
+      }));
+      const coreCopy = {
+        users: usersWithDigests,
+        sessions: data.sessions.slice(-200),
+        sessionsMap,
+        conversations: data.conversations,
+        messages: data.messages.slice(-500),
+        statuses: data.statuses,
+        statusViews: data.statusViews,
+        blocks: data.blocks,
+        contacts: data.contacts,
+        media: [],
+      };
+      const serializedCore = JSON.stringify(coreCopy);
+      if (serializedCore.length < 950000) {
+        const patchRes = await fetch(FIRESTORE_DOC_URL, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            fields: {
+              stateJson: { stringValue: serializedCore },
+              updatedAt: { stringValue: new Date().toISOString() },
+            },
+          }),
+        }).catch(() => null);
+
+        if (patchRes && patchRes.status === 429) {
+          firestoreQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000;
+          lastFirestoreQuotaError =
+            'Firestore free daily write quota (429 RESOURCE_EXHAUSTED) reached. Changes are saved to persistent backend storage and will sync when daily quota resets.';
+          return;
+        }
+      }
+
+      if (syncMedia) {
+        const fittingMedia: MediaRecord[] = [];
+        let currentLen = 20;
+        for (let i = data.media.length - 1; i >= 0; i--) {
+          const itemStr = JSON.stringify(data.media[i]);
+          if (currentLen + itemStr.length < 850000) {
+            fittingMedia.unshift(data.media[i]);
+            currentLen += itemStr.length + 2;
+          }
+        }
+        const serializedMedia = JSON.stringify({ media: fittingMedia });
+        await fetch(FIRESTORE_MEDIA_URL, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            fields: {
+              stateJson: { stringValue: serializedMedia },
+              updatedAt: { stringValue: new Date().toISOString() },
+            },
+          }),
+        }).catch(() => {});
+      }
+    } catch {
+      // Ignore serialization error
+    }
+  }, 1500);
 }
 
-// Seed cloud store on startup so existing local accounts (`saleh123`, `ahmad123`, `saleh1234`, etc.) are immediately in Firestore
-ensureCloudDatabaseLoaded(true).then(() => {
-  saveDatabase(db);
-});
+// Initial cloud sync check on startup
+ensureCloudDatabaseLoaded(true);
 
 function hashSecret(
   secret: string,
@@ -622,18 +642,11 @@ export function purgeExpiredRecords() {
 
 export function areUsersConnected(userA: string, userB: string): boolean {
   if (userA === userB) return true;
-  const hasContact = db.contacts.some(
+  return db.contacts.some(
     (c) =>
       (c.userId === userA && c.contactUserId === userB) ||
       (c.userId === userB && c.contactUserId === userA)
   );
-  if (hasContact) return true;
-  const hasConv = db.conversations.some(
-    (conv) =>
-      conv.participantIds.includes(userA) &&
-      conv.participantIds.includes(userB)
-  );
-  return hasConv;
 }
 
 export function isBlockedBetween(
@@ -734,12 +747,6 @@ export function createApiApp(
 ) {
   const app = express();
   app.use(express.json({ limit: '12mb' }));
-
-  // Ensure cloud state is loaded before handling API requests
-  app.use(async (_req, _res, next) => {
-    await ensureCloudDatabaseLoaded();
-    next();
-  });
 
   function resolveUserFromToken(token: string): UserRecord | null {
     if (!token) return null;
@@ -1404,26 +1411,14 @@ export function createApiApp(
     });
   });
 
-  // --- CONTACTS, BLOCKING, AND REPORTING ---
+  // --- CONTACTS, UNCONNECT, BLOCKING, AND REPORTING ---
   app.get('/api/contacts', requireAuth, async (req, res) => {
-    await ensureCloudDatabaseLoaded();
     const user = (req as express.Request & { user: UserRecord }).user;
 
+    // Contacts are strictly users that the current user has explicitly connected with
     const contactUserIds = new Set<string>();
     for (const c of db.contacts) {
       if (c.userId === user.id) contactUserIds.add(c.contactUserId);
-    }
-    for (const conv of db.conversations) {
-      if (
-        conv.participantIds.includes(user.id) &&
-        !conv.deletedBy.includes(user.id)
-      ) {
-        const otherId =
-          conv.participantIds[0] === user.id
-            ? conv.participantIds[1]
-            : conv.participantIds[0];
-        contactUserIds.add(otherId);
-      }
     }
 
     const contacts = Array.from(contactUserIds)
@@ -1431,6 +1426,7 @@ export function createApiApp(
       .filter((u): u is UserRecord => !!u)
       .map((u) => ({
         ...sanitizeUserForViewer(u, user.id),
+        isContact: true,
         isBlocked: db.blocks.some(
           (b) => b.blockerId === user.id && b.blockedUserId === u.id
         ),
@@ -1446,7 +1442,7 @@ export function createApiApp(
   });
 
   app.post('/api/contacts/add', requireAuth, async (req, res) => {
-    await ensureCloudDatabaseLoaded(true);
+    await ensureCloudDatabaseLoaded();
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId, targetUser } = req.body || {};
 
@@ -1511,7 +1507,33 @@ export function createApiApp(
       await saveDatabase();
     }
 
-    res.json({ contact: sanitizeUserForViewer(target, user.id) });
+    res.json({
+      contact: {
+        ...sanitizeUserForViewer(target, user.id),
+        isContact: true,
+      },
+    });
+  });
+
+  app.post('/api/contacts/remove', requireAuth, async (req, res) => {
+    const user = (req as express.Request & { user: UserRecord }).user;
+    const { targetUserId } = req.body || {};
+
+    if (!targetUserId || typeof targetUserId !== 'string') {
+      res.status(400).json({ error: 'Target user ID is required to unconnect.' });
+      return;
+    }
+
+    // Remove only the contact connection record; preserve user accounts and conversation history!
+    const beforeCount = db.contacts.length;
+    db.contacts = db.contacts.filter(
+      (c) => !(c.userId === user.id && c.contactUserId === targetUserId)
+    );
+    if (db.contacts.length !== beforeCount) {
+      await saveDatabase();
+    }
+
+    res.json({ success: true, targetUserId });
   });
 
   app.post('/api/users/block', requireAuth, async (req, res) => {
@@ -1746,7 +1768,12 @@ export function createApiApp(
           createdAt: conv.createdAt,
           updatedAt: lastMessage ? lastMessage.createdAt : conv.updatedAt,
           recipient: otherUser
-            ? sanitizeUserForViewer(otherUser, userId)
+            ? {
+                ...sanitizeUserForViewer(otherUser, userId),
+                isContact: db.contacts.some(
+                  (ct) => ct.userId === userId && ct.contactUserId === otherUser.id
+                ),
+              }
             : {
                 id: otherId,
                 fullName: 'Deleted Account',
@@ -1895,19 +1922,6 @@ export function createApiApp(
       db.conversations.push(conv);
     } else {
       conv.deletedBy = conv.deletedBy.filter((id) => id !== user.id);
-    }
-
-    if (
-      !db.contacts.some(
-        (c) => c.userId === user.id && c.contactUserId === recipient.id
-      )
-    ) {
-      db.contacts.push({
-        id: `cnt_${crypto.randomBytes(6).toString('hex')}`,
-        userId: user.id,
-        contactUserId: recipient.id,
-        createdAt: now,
-      });
     }
 
     await saveDatabase();
@@ -2201,6 +2215,10 @@ export function createApiApp(
       if (isBlockedBetween(user.id, s.userId).blocked) return false;
       const owner = db.users.find((u) => u.id === s.userId);
       if (!owner) return false;
+      const effectivePrivacy = s.privacy || owner.privacy.statusPrivacy || 'everyone';
+      if (effectivePrivacy === 'everyone') {
+        return true;
+      }
       return areUsersConnected(user.id, s.userId);
     });
 

@@ -586,6 +586,19 @@ export default function App() {
     fetchAllData();
   };
 
+  const handleRemoveContact = async (targetUserId: string) => {
+    if (!token || !isOnline) return;
+    await fetch('/api/contacts/remove', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ targetUserId }),
+    });
+    fetchAllData();
+  };
+
   const handleDeleteMessage = async (messageId: string, mode: 'me' | 'everyone') => {
     if (!token || !selectedConvId || !isOnline) return;
     await fetch(`/api/messages/${messageId}?mode=${mode}`, {
@@ -970,6 +983,8 @@ export default function App() {
                   onClearHistory={handleClearHistory}
                   onDeleteConversation={handleDeleteConversation}
                   onToggleBlockUser={handleToggleBlockUser}
+                  onRemoveContact={handleRemoveContact}
+                  onAddContact={handleAddContact}
                   onTyping={sendTypingSignal}
                 />
               ) : (
@@ -1037,6 +1052,7 @@ export default function App() {
             token={token}
             onOpenSearchModal={() => setShowUserSearchModal(true)}
             onStartConversation={handleStartConversation}
+            onRemoveContact={handleRemoveContact}
             onToggleBlock={handleToggleBlockUser}
             onUpdateWhoCanContact={async (setting) => {
               await handleUpdateProfile({

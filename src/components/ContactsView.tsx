@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import {
   UserPlus,
+  UserMinus,
+  MoreVertical,
   MessageSquare,
   ShieldBan,
   Flag,
@@ -19,6 +21,7 @@ interface ContactsViewProps {
   token: string;
   onOpenSearchModal: () => void;
   onStartConversation: (user: UserProfile) => void;
+  onRemoveContact: (userId: string) => Promise<void>;
   onToggleBlock: (userId: string, currentlyBlocked: boolean) => Promise<void>;
   onUpdateWhoCanContact: (setting: 'everyone' | 'contacts') => Promise<void>;
 }
@@ -30,10 +33,14 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
   token,
   onOpenSearchModal,
   onStartConversation,
+  onRemoveContact,
   onToggleBlock,
   onUpdateWhoCanContact,
 }) => {
   const [filterQuery, setFilterQuery] = useState('');
+  const [openMenuUserId, setOpenMenuUserId] = useState<string | null>(null);
+  const [confirmUnconnectUser, setConfirmUnconnectUser] = useState<UserProfile | null>(null);
+  const [unconnecting, setUnconnecting] = useState(false);
   const [reportingUser, setReportingUser] = useState<UserProfile | null>(null);
   const [reportReason, setReportReason] = useState('Spam or unsolicited messages');
   const [reportDetails, setReportDetails] = useState('');
@@ -45,6 +52,17 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
       c.fullName.toLowerCase().includes(filterQuery.toLowerCase()) ||
       c.username.toLowerCase().includes(filterQuery.toLowerCase())
   );
+
+  const handleConfirmUnconnect = async () => {
+    if (!confirmUnconnectUser) return;
+    setUnconnecting(true);
+    try {
+      await onRemoveContact(confirmUnconnectUser.id);
+      setConfirmUnconnectUser(null);
+    } finally {
+      setUnconnecting(false);
+    }
+  };
 
   const handleSubmitReport = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -78,7 +96,7 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
         <div>
           <h1 className="font-display text-xl font-bold text-[#1C1C1E]">Contacts & Connections</h1>
           <p className="text-xs text-[#636366] mt-0.5">
-            Manage your trusted directory, privacy permissions, and blocked accounts
+            Manage your connected users, privacy permissions, and blocked accounts
           </p>
         </div>
         <button
@@ -157,17 +175,17 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
 
         {filteredContacts.length === 0 ? (
           <div className="bg-white rounded-2xl border border-[#E5E5EA] p-8 text-center">
-            <p className="text-sm font-medium text-[#1C1C1E]">No matching contacts</p>
+            <p className="text-sm font-medium text-[#1C1C1E]">No connected contacts yet</p>
             <p className="text-xs text-[#636366] mt-1">
-              Use the Find User button to search by exact username or registered email address.
+              Use the Find User button to search by username or registered Gmail and click Connect.
             </p>
           </div>
         ) : (
-          <div className="bg-white rounded-2xl border border-[#E5E5EA] divide-y divide-[#E5E5EA] overflow-hidden">
+          <div className="bg-white rounded-2xl border border-[#E5E5EA] divide-y divide-[#E5E5EA]">
             {filteredContacts.map((contact) => (
               <div
                 key={contact.id}
-                className="p-4 flex items-center justify-between gap-3 hover:bg-[#F8F9FA] transition-colors"
+                className="p-4 flex items-center justify-between gap-3 hover:bg-[#F8F9FA] transition-colors relative"
               >
                 <div className="flex items-center gap-3.5 min-w-0">
                   <Avatar
@@ -208,27 +226,67 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
                     <MessageSquare className="w-3.5 h-3.5" />
                     <span>Message</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => onToggleBlock(contact.id, !!contact.isBlocked)}
-                    className={`min-h-[40px] px-2.5 rounded-xl border text-xs font-medium flex items-center gap-1 transition-colors ${
-                      contact.isBlocked
-                        ? 'bg-[#FEF2F2] border-[#FECACA] text-[#B91C1C]'
-                        : 'bg-white border-[#E5E5EA] text-[#636366] hover:text-[#1C1C1E]'
-                    }`}
-                    title={contact.isBlocked ? 'Unblock user' : 'Block user'}
-                  >
-                    <ShieldBan className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">{contact.isBlocked ? 'Unblock' : 'Block'}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setReportingUser(contact)}
-                    className="min-h-[40px] px-2.5 rounded-xl bg-white border border-[#E5E5EA] text-[#636366] hover:text-[#B91C1C] text-xs flex items-center justify-center transition-colors"
-                    title="Report abusive account"
-                  >
-                    <Flag className="w-3.5 h-3.5" />
-                  </button>
+
+                  {/* Three-Dot Menu for Unconnect, Block, and Report */}
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setOpenMenuUserId(openMenuUserId === contact.id ? null : contact.id)
+                      }
+                      className="min-h-[40px] min-w-[40px] rounded-xl bg-white border border-[#E5E5EA] hover:bg-[#F2F2F7] text-[#3A3A3C] flex items-center justify-center transition-colors"
+                      aria-label={`Options for ${contact.fullName}`}
+                      title="More options"
+                    >
+                      <MoreVertical className="w-4 h-4" />
+                    </button>
+
+                    {openMenuUserId === contact.id && (
+                      <>
+                        <div
+                          className="fixed inset-0 z-20"
+                          onClick={() => setOpenMenuUserId(null)}
+                        />
+                        <div className="absolute right-0 mt-1.5 w-48 rounded-2xl bg-white border border-[#E5E5EA] shadow-lg py-1.5 z-30">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenMenuUserId(null);
+                              setConfirmUnconnectUser(contact);
+                            }}
+                            className="w-full px-4 py-2.5 text-left text-xs font-medium text-[#B91C1C] hover:bg-[#FEF2F2] flex items-center gap-2.5"
+                          >
+                            <UserMinus className="w-4 h-4" />
+                            <span>Unconnect</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenMenuUserId(null);
+                              onToggleBlock(contact.id, !!contact.isBlocked);
+                            }}
+                            className="w-full px-4 py-2.5 text-left text-xs font-medium text-[#1C1C1E] hover:bg-[#F8F9FA] flex items-center gap-2.5"
+                          >
+                            <ShieldBan className="w-4 h-4 text-[#636366]" />
+                            <span>{contact.isBlocked ? 'Unblock User' : 'Block User'}</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenMenuUserId(null);
+                              setReportingUser(contact);
+                            }}
+                            className="w-full px-4 py-2.5 text-left text-xs font-medium text-[#1C1C1E] hover:bg-[#F8F9FA] flex items-center gap-2.5"
+                          >
+                            <Flag className="w-4 h-4 text-[#636366]" />
+                            <span>Report Account</span>
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}
@@ -263,6 +321,38 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
             ))}
           </div>
         </section>
+      )}
+
+      {/* Unconnect Confirmation Dialog */}
+      {confirmUnconnectUser && (
+        <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white border border-[#E5E5EA] p-6 shadow-xl">
+            <h3 className="font-display text-base font-semibold text-[#1C1C1E]">
+              Unconnect @{confirmUnconnectUser.username}?
+            </h3>
+            <p className="text-xs text-[#636366] mt-2 leading-relaxed">
+              Are you sure you want to remove <strong>{confirmUnconnectUser.fullName}</strong> from your connected contacts? Your existing conversation history will not be deleted.
+            </p>
+            <div className="mt-5 flex items-center gap-2.5">
+              <button
+                type="button"
+                disabled={unconnecting}
+                onClick={() => setConfirmUnconnectUser(null)}
+                className="flex-1 h-11 rounded-xl bg-[#F2F2F7] text-xs font-semibold text-[#1C1C1E]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={unconnecting}
+                onClick={handleConfirmUnconnect}
+                className="flex-1 h-11 rounded-xl bg-[#B91C1C] hover:bg-[#991B1B] text-xs font-semibold text-white"
+              >
+                {unconnecting ? 'Removing...' : 'Unconnect'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Report Account Modal */}

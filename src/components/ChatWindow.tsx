@@ -15,6 +15,8 @@ import {
   AlertCircle,
   RotateCcw,
   ShieldBan,
+  UserMinus,
+  UserPlus,
 } from 'lucide-react';
 import { ConversationItem, MessageItem, UserProfile } from '../types';
 import { Avatar } from './Avatar';
@@ -43,6 +45,8 @@ interface ChatWindowProps {
   onClearHistory: (conversationId: string) => Promise<void>;
   onDeleteConversation: (conversationId: string) => Promise<void>;
   onToggleBlockUser: (targetUserId: string, currentlyBlocked: boolean) => Promise<void>;
+  onRemoveContact?: (targetUserId: string) => Promise<void>;
+  onAddContact?: (targetUser: UserProfile) => Promise<void>;
   onTyping: (conversationId: string, isTyping: boolean) => void;
 }
 
@@ -65,6 +69,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   onClearHistory,
   onDeleteConversation,
   onToggleBlockUser,
+  onRemoveContact,
+  onAddContact,
   onTyping,
 }) => {
   const draftStorageKey = `nacre_draft_${currentUser.id}_${conversation.id}`;
@@ -84,6 +90,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [copiedUsername, setCopiedUsername] = useState(false);
   const [confirmClearModal, setConfirmClearModal] = useState(false);
   const [confirmDeleteConvModal, setConfirmDeleteConvModal] = useState(false);
+  const [confirmUnconnectModal, setConfirmUnconnectModal] = useState(false);
+  const [confirmConnectModal, setConfirmConnectModal] = useState(false);
 
   // Image preview before sending
   const [pendingImage, setPendingImage] = useState<{
@@ -361,6 +369,32 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                   <Copy className="w-4 h-4 text-[#636366]" />
                   <span>Copy Username (@{recipient.username})</span>
                 </button>
+                {recipient.isContact && onRemoveContact && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowHeaderMenu(false);
+                      setConfirmUnconnectModal(true);
+                    }}
+                    className="w-full px-4 py-2.5 text-left text-xs font-medium text-[#1C1C1E] hover:bg-[#F8F9FA] flex items-center gap-2.5"
+                  >
+                    <UserMinus className="w-4 h-4 text-[#636366]" />
+                    <span>Unconnect</span>
+                  </button>
+                )}
+                {!recipient.isContact && onAddContact && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowHeaderMenu(false);
+                      setConfirmConnectModal(true);
+                    }}
+                    className="w-full px-4 py-2.5 text-left text-xs font-medium text-[#1C1C1E] hover:bg-[#F8F9FA] flex items-center gap-2.5"
+                  >
+                    <UserPlus className="w-4 h-4 text-[#636366]" />
+                    <span>Connect Contact</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -806,6 +840,68 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 className="flex-1 h-11 rounded-xl bg-[#B91C1C] text-xs font-semibold text-white"
               >
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Unconnect Confirmation Modal */}
+      {confirmUnconnectModal && onRemoveContact && (
+        <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white border border-[#E5E5EA] p-6 shadow-xl">
+            <h3 className="font-display text-base font-semibold text-[#1C1C1E]">
+              Unconnect @{recipient.username}?
+            </h3>
+            <p className="text-xs text-[#636366] mt-2 leading-relaxed">
+              Are you sure you want to remove <strong>{recipient.fullName}</strong> from your contacts? Your chat history will remain intact.
+            </p>
+            <div className="mt-5 flex items-center gap-2.5">
+              <button
+                onClick={() => setConfirmUnconnectModal(false)}
+                className="flex-1 h-11 rounded-xl bg-[#F2F2F7] text-xs font-semibold text-[#1C1C1E]"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  setConfirmUnconnectModal(false);
+                  await onRemoveContact(recipient.id);
+                }}
+                className="flex-1 h-11 rounded-xl bg-[#B91C1C] text-xs font-semibold text-white"
+              >
+                Unconnect
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Connect Confirmation Modal */}
+      {confirmConnectModal && onAddContact && (
+        <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white border border-[#E5E5EA] p-6 shadow-xl">
+            <h3 className="font-display text-base font-semibold text-[#1C1C1E]">
+              Connect with {recipient.fullName}
+            </h3>
+            <p className="text-xs text-[#636366] mt-2 leading-relaxed">
+              Do you want to add this person to your contacts?
+            </p>
+            <div className="mt-5 flex items-center gap-2.5">
+              <button
+                onClick={() => setConfirmConnectModal(false)}
+                className="flex-1 h-11 rounded-xl bg-[#F2F2F7] text-xs font-semibold text-[#1C1C1E]"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  setConfirmConnectModal(false);
+                  await onAddContact(recipient);
+                }}
+                className="flex-1 h-11 rounded-xl bg-[#2C2C2E] text-xs font-semibold text-white"
+              >
+                Connect
               </button>
             </div>
           </div>

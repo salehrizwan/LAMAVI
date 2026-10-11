@@ -10,7 +10,7 @@ interface UserSearchModalProps {
   isOnline: boolean;
   onClose: () => void;
   onStartConversation: (targetUser: UserProfile) => void;
-  onAddContact?: (targetUser: UserProfile) => void;
+  onAddContact?: (targetUser: UserProfile) => Promise<void> | void;
 }
 
 export const UserSearchModal: React.FC<UserSearchModalProps> = ({
@@ -27,6 +27,8 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
   const [results, setResults] = useState<UserProfile[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [addedContactIds, setAddedContactIds] = useState<Record<string, boolean>>({});
+  const [confirmConnectUser, setConfirmConnectUser] = useState<UserProfile | null>(null);
+  const [connecting, setConnecting] = useState(false);
   const [fullScreenDp, setFullScreenDp] = useState<{ src: string; caption?: string } | null>(null);
 
   const handleSearch = async (e: React.FormEvent) => {
@@ -61,6 +63,18 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
       setErrorMsg('Offline or network error. User search requires an active internet connection.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleConfirmConnect = async () => {
+    if (!confirmConnectUser || !onAddContact) return;
+    setConnecting(true);
+    try {
+      await onAddContact(confirmConnectUser);
+      setAddedContactIds((prev) => ({ ...prev, [confirmConnectUser.id]: true }));
+      setConfirmConnectUser(null);
+    } finally {
+      setConnecting(false);
     }
   };
 
@@ -190,10 +204,7 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
                   <button
                     type="button"
                     disabled={!isOnline}
-                    onClick={() => {
-                      onAddContact(result);
-                      setAddedContactIds((prev) => ({ ...prev, [result.id]: true }));
-                    }}
+                    onClick={() => setConfirmConnectUser(result)}
                     className="h-11 px-4 rounded-xl bg-white hover:bg-[#F2F2F7] disabled:opacity-40 border border-[#D1D1D6] text-xs font-semibold text-[#1C1C1E] flex items-center justify-center gap-1.5 transition-colors"
                   >
                     <UserPlus className="w-4 h-4" />
@@ -217,34 +228,88 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
               </p>
               {results
                 .filter((u) => u.id !== result?.id)
-                .map((u) => (
-                  <div
-                    key={u.id}
-                    className="p-3 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA] flex items-center justify-between gap-3"
-                  >
+                .map((u) => {
+                  const isConnected = u.isContact || addedContactIds[u.id];
+                  return (
                     <div
-                      onClick={() => setResult(u)}
-                      className="flex items-center gap-2.5 min-w-0 cursor-pointer"
+                      key={u.id}
+                      className="p-3 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA] flex items-center justify-between gap-3"
                     >
-                      <Avatar src={u.avatarUrl} name={u.fullName} size="sm" isOnline={u.isOnline} showPresence />
-                      <div className="min-w-0">
-                        <p className="text-xs font-semibold text-[#1C1C1E] truncate">{u.fullName}</p>
-                        <p className="text-[11px] text-[#636366] truncate">@{u.username}</p>
+                      <div
+                        onClick={() => setResult(u)}
+                        className="flex items-center gap-2.5 min-w-0 cursor-pointer"
+                      >
+                        <Avatar
+                          src={u.avatarUrl}
+                          name={u.fullName}
+                          size="sm"
+                          isOnline={u.isOnline}
+                          showPresence
+                        />
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-[#1C1C1E] truncate">
+                            {u.fullName}
+                          </p>
+                          <p className="text-[11px] text-[#636366] truncate">@{u.username}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {!isConnected && onAddContact && (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmConnectUser(u)}
+                            className="h-8 px-2.5 rounded-xl bg-white border border-[#D1D1D6] text-[#1C1C1E] text-[11px] font-semibold hover:bg-[#F2F2F7]"
+                          >
+                            Connect
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => onStartConversation(u)}
+                          className="h-8 px-3 rounded-xl bg-[#2C2C2E] text-white text-[11px] font-semibold hover:bg-[#3A3A3C]"
+                        >
+                          Message
+                        </button>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => onStartConversation(u)}
-                      className="h-8 px-3 rounded-xl bg-[#2C2C2E] text-white text-[11px] font-semibold shrink-0 hover:bg-[#3A3A3C]"
-                    >
-                      Message
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
             </div>
           )}
         </div>
       </div>
+
+      {/* Connection Confirmation Dialog */}
+      {confirmConnectUser && (
+        <div className="fixed inset-0 z-50 bg-black/45 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white border border-[#E5E5EA] p-6 shadow-xl">
+            <h3 className="font-display text-base font-semibold text-[#1C1C1E]">
+              Connect with {confirmConnectUser.fullName}
+            </h3>
+            <p className="text-xs text-[#636366] mt-2 leading-relaxed">
+              Do you want to add this person to your contacts?
+            </p>
+            <div className="mt-5 flex items-center gap-2.5">
+              <button
+                type="button"
+                disabled={connecting}
+                onClick={() => setConfirmConnectUser(null)}
+                className="flex-1 h-11 rounded-xl bg-[#F2F2F7] text-xs font-semibold text-[#1C1C1E]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={connecting}
+                onClick={handleConfirmConnect}
+                className="flex-1 h-11 rounded-xl bg-[#2C2C2E] hover:bg-[#3A3A3C] text-xs font-semibold text-white"
+              >
+                {connecting ? 'Connecting...' : 'Connect'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {fullScreenDp && (
         <FullScreenImageViewer

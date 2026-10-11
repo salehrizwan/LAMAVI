@@ -281,7 +281,10 @@ function normalizeParsedCloudState(rawObj: Record<string, unknown>): CloudState 
   return base;
 }
 
-async function readCloudState(): Promise<CloudState> {
+let clientQuotaBackoffUntilMs = 0;
+let lastClientCloudReadMs = 0;
+
+async function readCloudState(force = false): Promise<CloudState> {
   let cloudState: CloudState = emptyState();
   let localState: CloudState = emptyState();
 
@@ -294,31 +297,26 @@ async function readCloudState(): Promise<CloudState> {
     // ignore
   }
 
-  try {
-    const [snapState, snapMedia] = await Promise.all([
-      getDoc(doc(clientDb, 'lamavi_public', 'app_state')).catch(() => null),
-      getDoc(doc(clientDb, 'lamavi_public', 'app_media')).catch(() => null),
-    ]);
-    if (snapState && snapState.exists()) {
-      const data = snapState.data();
-      if (data && typeof data.stateJson === 'string') {
-        cloudState = normalizeParsedCloudState(JSON.parse(data.stateJson));
-      }
-    }
-    if (snapMedia && snapMedia.exists()) {
-      const mData = snapMedia.data();
-      if (mData && typeof mData.stateJson === 'string') {
-        const parsedMediaObj = JSON.parse(mData.stateJson) as { media?: StoredMedia[] };
-        if (Array.isArray(parsedMediaObj.media)) {
-          cloudState = mergeCloudStates(cloudState, {
-            ...emptyState(),
-            media: parsedMediaObj.media,
-          });
+  const now = Date.now();
+  const canReadFirestore =
+    now >= clientQuotaBackoffUntilMs && (force || now - lastClientCloudReadMs >= 30000);
+
+  if (canReadFirestore) {
+    lastClientCloudReadMs = now;
+    try {
+      const snapState = await getDoc(doc(clientDb, 'lamavi_public', 'app_state'));
+      if (snapState && snapState.exists()) {
+        const data = snapState.data();
+        if (data && typeof data.stateJson === 'string') {
+          cloudState = normalizeParsedCloudState(JSON.parse(data.stateJson));
         }
       }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('resource-exhausted') || errMsg.includes('Quota exceeded') || errMsg.includes('429')) {
+        clientQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000;
+      }
     }
-  } catch {
-    // Fallback to localStorage if offline
   }
 
   const resolved = mergeCloudStates(cloudState, localState);
@@ -329,22 +327,19 @@ async function readCloudState(): Promise<CloudState> {
   resolved.media = (resolved.media || []).filter((med) => !med.expiresAt || med.expiresAt > nowIso);
   resolved.statuses = (resolved.statuses || []).filter((s) => !s.expiresAt || s.expiresAt > nowIso);
 
-  // If local had users that weren't in cloud yet, push merged state back to cloud
-  if (resolved.users.length > cloudState.users.length) {
-    writeCloudState(resolved).catch(() => {});
-  }
-
   return resolved;
 }
 
-async function writeCloudState(state: CloudState): Promise<void> {
+async function writeCloudState(state: CloudState, syncMedia = false): Promise<void> {
   try {
     localStorage.setItem(LOCAL_CLOUD_KEY, JSON.stringify(state));
   } catch {
     // ignore
   }
+  if (Date.now() < clientQuotaBackoffUntilMs) {
+    return;
+  }
   try {
-    // Store core users, sessions, conversations, messages, statuses, contacts in `app_state` without heavy base64 media so it never exceeds 1MB
     const coreState: CloudState = {
       ...state,
       messages: state.messages.slice(-500),
@@ -358,23 +353,27 @@ async function writeCloudState(state: CloudState): Promise<void> {
       });
     }
 
-    // Store fitting media items in `app_media` under 850KB
-    const fittingMedia: StoredMedia[] = [];
-    let currentLen = 20;
-    for (let i = state.media.length - 1; i >= 0; i--) {
-      const itemStr = JSON.stringify(state.media[i]);
-      if (currentLen + itemStr.length < 850000) {
-        fittingMedia.unshift(state.media[i]);
-        currentLen += itemStr.length + 2;
+    if (syncMedia) {
+      const fittingMedia: StoredMedia[] = [];
+      let currentLen = 20;
+      for (let i = state.media.length - 1; i >= 0; i--) {
+        const itemStr = JSON.stringify(state.media[i]);
+        if (currentLen + itemStr.length < 850000) {
+          fittingMedia.unshift(state.media[i]);
+          currentLen += itemStr.length + 2;
+        }
       }
+      const mediaJson = JSON.stringify({ media: fittingMedia });
+      await setDoc(doc(clientDb, 'lamavi_public', 'app_media'), {
+        stateJson: mediaJson,
+        updatedAt: new Date().toISOString(),
+      });
     }
-    const mediaJson = JSON.stringify({ media: fittingMedia });
-    await setDoc(doc(clientDb, 'lamavi_public', 'app_media'), {
-      stateJson: mediaJson,
-      updatedAt: new Date().toISOString(),
-    });
-  } catch {
-    // ignore if offline
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes('resource-exhausted') || errMsg.includes('Quota exceeded') || errMsg.includes('429')) {
+      clientQuotaBackoffUntilMs = Date.now() + 10 * 60 * 1000;
+    }
   }
 }
 
@@ -389,15 +388,31 @@ function toUserProfile(u: StoredUser, viewerId: string, state: CloudState): User
     (c) => c.userId === viewerId && c.contactUserId === u.id
   );
 
+  const connected =
+    isSelf ||
+    (state.contacts || []).some(
+      (c) =>
+        (c.userId === viewerId && c.contactUserId === u.id) ||
+        (c.userId === u.id && c.contactUserId === viewerId)
+    );
+  const canSeeProfilePic =
+    isSelf ||
+    u.privacy.profilePicVisibility === 'everyone' ||
+    (u.privacy.profilePicVisibility === 'contacts' && connected);
+  const canSeeLastSeen =
+    isSelf ||
+    u.privacy.lastSeenVisibility === 'everyone' ||
+    (u.privacy.lastSeenVisibility === 'contacts' && connected);
+
   return {
     id: u.id,
     fullName: u.fullName,
     username: u.username,
     email: isSelf ? u.email : undefined,
     bio: u.bio,
-    avatarUrl: u.avatarUrl,
-    isOnline: u.isOnline,
-    lastSeen: u.lastSeen,
+    avatarUrl: canSeeProfilePic ? u.avatarUrl : '',
+    isOnline: canSeeLastSeen ? u.isOnline : false,
+    lastSeen: canSeeLastSeen ? u.lastSeen : null,
     createdAt: u.createdAt,
     usernameChangesRemaining: isSelf ? Math.max(0, 3 - recentChanges.length) : undefined,
     privacy: isSelf ? u.privacy : undefined,
@@ -408,10 +423,8 @@ function toUserProfile(u: StoredUser, viewerId: string, state: CloudState): User
   };
 }
 
-// Intercept `/api/*` calls automatically when running on a static host where the backend returns 404/HTML or throws a network error, and also sync any local device accounts up to Firestore on boot
+// Intercept `/api/*` calls automatically when running on a static host where the backend returns 404/HTML or throws a network error
 export function installServerlessFallbackInterceptor() {
-  // Immediately sync any locally stored accounts on this device to Firestore so other devices can find them
-  readCloudState().catch(() => {});
 
   const originalFetch = window.fetch.bind(window);
 
@@ -935,25 +948,16 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     });
   }
 
-  // Contacts
+  // Contacts (strictly explicit connections)
   if (pathname === '/api/contacts' && method === 'GET') {
     const contactIds = new Set<string>();
     for (const c of state.contacts) {
       if (c.userId === currentUser.id) contactIds.add(c.contactUserId);
     }
-    for (const conv of state.conversations) {
-      if (conv.participantIds.includes(currentUser.id)) {
-        const other =
-          conv.participantIds[0] === currentUser.id
-            ? conv.participantIds[1]
-            : conv.participantIds[0];
-        contactIds.add(other);
-      }
-    }
     const contacts = Array.from(contactIds)
       .map((id) => state.users.find((u) => u.id === id))
       .filter((u): u is StoredUser => !!u)
-      .map((u) => toUserProfile(u, currentUser.id, state));
+      .map((u) => ({ ...toUserProfile(u, currentUser.id, state), isContact: true }));
     const blockedUsers = state.blocks
       .filter((b) => b.blockerId === currentUser.id)
       .map((b) => state.users.find((u) => u.id === b.blockedUserId))
@@ -1001,7 +1005,21 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       state.contacts.push({ userId: currentUser.id, contactUserId: targetUserId });
       await writeCloudState(state);
     }
-    return jsonResponse(200, { contact: toUserProfile(target, currentUser.id, state) });
+    return jsonResponse(200, {
+      contact: { ...toUserProfile(target, currentUser.id, state), isContact: true },
+    });
+  }
+
+  if (pathname === '/api/contacts/remove' && method === 'POST') {
+    const { targetUserId } = bodyObj;
+    if (!targetUserId) {
+      return jsonResponse(400, { error: 'Target user ID is required to unconnect.' });
+    }
+    state.contacts = state.contacts.filter(
+      (c) => !(c.userId === currentUser.id && c.contactUserId === targetUserId)
+    );
+    await writeCloudState(state);
+    return jsonResponse(200, { success: true, targetUserId });
   }
 
   if (pathname === '/api/users/block' && method === 'POST') {
@@ -1137,13 +1155,6 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
     } else {
       conv.deletedBy = conv.deletedBy.filter((id) => id !== currentUser.id);
     }
-    if (
-      !state.contacts.some(
-        (c) => c.userId === currentUser.id && c.contactUserId === recipientId
-      )
-    ) {
-      state.contacts.push({ userId: currentUser.id, contactUserId: recipientId });
-    }
     await writeCloudState(state);
     return jsonResponse(200, {
       conversation: {
@@ -1271,19 +1282,29 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
 
   if (pathname === '/api/statuses' && method === 'GET') {
     const statuses: StatusItem[] = state.statuses
-      .filter(
-        (s) =>
-          s.userId === currentUser.id ||
-          state.contacts.some(
+      .filter((s) => {
+        if (s.userId === currentUser.id) return true;
+        const blocked = state.blocks.some(
+          (b) =>
+            (b.blockerId === currentUser.id && b.blockedUserId === s.userId) ||
+            (b.blockerId === s.userId && b.blockedUserId === currentUser.id)
+        );
+        if (blocked) return false;
+        const owner = state.users.find((u) => u.id === s.userId);
+        if (!owner) return false;
+        const effectivePrivacy =
+          s.privacy === 'contacts' || owner.privacy.statusPrivacy === 'contacts'
+            ? 'contacts'
+            : 'everyone';
+        if (effectivePrivacy === 'contacts') {
+          return state.contacts.some(
             (c) =>
               (c.userId === currentUser.id && c.contactUserId === s.userId) ||
               (c.userId === s.userId && c.contactUserId === currentUser.id)
-          ) ||
-          state.conversations.some(
-            (cv) =>
-              cv.participantIds.includes(currentUser.id) && cv.participantIds.includes(s.userId)
-          )
-      )
+          );
+        }
+        return true;
+      })
       .map((s) => {
         const owner = state.users.find((u) => u.id === s.userId);
         return {
