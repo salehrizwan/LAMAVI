@@ -10,6 +10,7 @@ import {
   sanitizeUserForViewer,
   isBlockedBetween,
   purgeExpiredRecords,
+  ensureCloudDatabaseLoaded,
 } from './api/index';
 
 async function startServer() {
@@ -62,7 +63,8 @@ async function startServer() {
     }
   });
 
-  wss.on('connection', (ws, request) => {
+  wss.on('connection', async (ws, request) => {
+    await ensureCloudDatabaseLoaded();
     const url = new URL(request.url || '', `http://${request.headers.host}`);
     const token = url.searchParams.get('token') || '';
     const now = new Date().toISOString();
@@ -140,7 +142,8 @@ async function startServer() {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== 'true' ? { server: httpServer } : false,
+        hmr: false,
+        watch: null,
       },
       appType: 'spa',
     });
