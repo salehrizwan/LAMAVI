@@ -2,14 +2,6 @@ import express from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { initializeApp, getApps } from 'firebase/app';
-import {
-  getFirestore,
-  doc,
-  getDoc,
-  setDoc,
-  getDocFromServer,
-} from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 // --- TYPES & DATA MODEL ---
@@ -154,29 +146,6 @@ export interface DatabaseSchema {
   contacts: ContactRecord[];
 }
 
-// Initialize Firebase Cloud Firestore for cross-instance & Vercel persistence
-const firebaseApp =
-  getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
-export const firestoreDb = getFirestore(
-  firebaseApp,
-  firebaseConfig.firestoreDatabaseId
-);
-
-// Validate connection on boot as required
-async function testFirestoreConnection() {
-  try {
-    await getDocFromServer(doc(firestoreDb, 'test', 'connection'));
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.includes('the client is offline')
-    ) {
-      console.error('Please check your Firebase configuration.');
-    }
-  }
-}
-testFirestoreConnection();
-
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const DEMO_USER_IDS = new Set([
@@ -296,19 +265,6 @@ export async function ensureCloudDatabaseLoaded(): Promise<void> {
         const parsed = cleanParsedDatabase(JSON.parse(rawJson) as DatabaseSchema);
         if (parsed.users.length >= db.users.length) {
           db = parsed;
-        }
-      }
-    } else {
-      const snap = await getDoc(doc(firestoreDb, 'lamavi_store', 'core_state'));
-      if (snap.exists()) {
-        const data = snap.data();
-        if (data && typeof data.payloadJson === 'string') {
-          const parsed = cleanParsedDatabase(
-            JSON.parse(data.payloadJson) as DatabaseSchema
-          );
-          if (parsed.users.length >= db.users.length) {
-            db = parsed;
-          }
         }
       }
     }
