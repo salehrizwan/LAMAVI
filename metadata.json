@@ -1,0 +1,6 @@
+{
+  "name": "Nacre Messenger",
+  "description": "A premium, white-and-silver iOS-inspired real-time messaging application with account creation, status updates, image sharing, and offline-first sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

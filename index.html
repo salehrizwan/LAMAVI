@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        try {
+          var currentFetch = window.fetch;
+          var patchTarget = function (target) {
+            if (!target) return;
+            try {
+              Object.defineProperty(target, 'fetch', {
+                get: function () {
+                  return currentFetch;
+                },
+                set: function (fn) {
+                  if (typeof fn === 'function') {
+                    currentFetch = fn;
+                  }
+                },
+                configurable: true,
+                enumerable: true,
+              });
+            } catch (err) {}
+          };
+          patchTarget(window);
+          patchTarget( globalThis );
+          if (typeof Window !== 'undefined' && Window.prototype) {
+            patchTarget(Window.prototype);
+          }
+          window.addEventListener(
+            'error',
+            function (e) {
+              if (
+                (e.filename && e.filename.indexOf('chrome-extension://') === 0) ||
+                (e.message && e.message.indexOf('Cannot set property fetch') !== -1)
+              ) {
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                return false;
+              }
+            },
+            true
+          );
+          window.addEventListener(
+            'unhandledrejection',
+            function (e) {
+              var msg = e.reason && (e.reason.message || String(e.reason));
+              if (msg && msg.indexOf('Cannot set property fetch') !== -1) {
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                return false;
+              }
+            },
+            true
+          );
+        } catch (e) {}
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>LAMAVI — Let's connect each other</title>
+    <meta name="description" content="LAMAVI — Let's connect each other. Premium white-and-silver iOS-inspired messaging application." />
+    <meta property="og:title" content="LAMAVI — Let's connect each other" />
+    <meta property="og:description" content="LAMAVI — Let's connect each other. Premium white-and-silver iOS-inspired messaging application." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#F8F9FA" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="LAMAVI" />
+    <link rel="apple-touch-icon" href="/logo.png" />
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-[#F8F9FA] text-[#1C1C1E] antialiased selection:bg-[#E5E5EA] selection:text-[#1C1C1E]">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
