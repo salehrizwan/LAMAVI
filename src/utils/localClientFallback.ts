@@ -633,36 +633,17 @@ export function installLocalFallbackInterceptor() {
         }
         return response;
       }
-      // If the response for `/api/*` is NOT JSON (e.g., an HTML proxy challenge or 502 page),
-      // return an honest JSON error for auth, search, and message write endpoints so the UI never silently saves to localStorage while claiming cloud persistence.
-      if (
-        urlStr.startsWith('/api/auth/register') ||
-        urlStr.startsWith('/api/auth/login') ||
-        urlStr.startsWith('/api/users/search') ||
-        urlStr.startsWith('/api/conversations/start') ||
-        /^\/api\/conversations\/[^/]+\/messages$/.test(urlStr)
-      ) {
-        return jsonResponse(503, {
-          error:
-            'Could not reach the LAMAVI cloud server. Please refresh the page and ensure you are using the active app URL.',
-        });
-      }
+      // If the response for `/api/*` is NOT JSON (e.g., an HTML rewrite error, proxy challenge, or 502 page),
+      // return an honest JSON error for ALL `/api/*` endpoints so the UI never silently reads or writes localStorage while claiming cloud persistence.
+      return jsonResponse(response.status >= 400 ? response.status : 503, {
+        error: `LAMAVI API returned a non-JSON response (HTTP ${response.status}). Please verify your deployment and refresh the page.`,
+      });
     } catch {
-      if (
-        urlStr.startsWith('/api/auth/register') ||
-        urlStr.startsWith('/api/auth/login') ||
-        urlStr.startsWith('/api/users/search') ||
-        urlStr.startsWith('/api/conversations/start') ||
-        (/^\/api\/conversations\/[^/]+\/messages$/.test(urlStr) && init?.method === 'POST')
-      ) {
-        return jsonResponse(503, {
-          error:
-            'Network error reaching the LAMAVI server. Please check your internet connection and retry.',
-        });
-      }
+      return jsonResponse(503, {
+        error:
+          'Network error reaching the LAMAVI server. Please check your internet connection and retry.',
+      });
     }
-
-    return handleFallbackApiRequest(urlStr, nextInit);
   };
 
   try {

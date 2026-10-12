@@ -27,17 +27,34 @@ let lastSupabaseSyncedAt: string | null = null;
 let lastSupabaseError: string | null = null;
 
 export function getSupabaseProjectUrl(): string {
-  const url = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
+  const url = (
+    process.env.SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.VITE_SUPABASE_URL ||
+    ''
+  ).trim();
   return url.replace(/\/+$/, '');
+}
+
+export function getSupabaseServiceKey(): string {
+  return (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SERVICE_KEY ||
+    process.env.SUPABASE_SECRET_KEY ||
+    process.env.SUPABASE_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY ||
+    ''
+  ).trim();
 }
 
 export function isSupabaseConfigured(): boolean {
   const url = getSupabaseProjectUrl();
-  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const key = getSupabaseServiceKey();
   return (
     Boolean(url && key) &&
     !url.includes('YOUR_PROJECT_REF') &&
     !key.includes('YOUR_SUPABASE_SERVICE_ROLE_KEY') &&
+    !key.includes('YOUR_SUPABASE_ANON_KEY') &&
     url.startsWith('https://')
   );
 }
@@ -57,7 +74,7 @@ export function getActiveDbProvider(): 'local' | 'supabase' {
 
 export function getSupabaseAdapterStatus(): SupabaseAdapterStatus {
   const url = getSupabaseProjectUrl();
-  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const key = getSupabaseServiceKey();
   const dbUrl = (process.env.SUPABASE_DB_URL || '').trim();
   const supabaseUrlConfigured = Boolean(
     url && !url.includes('YOUR_PROJECT_REF') && url.startsWith('https://')
@@ -82,7 +99,7 @@ export function getSupabaseAdapterStatus(): SupabaseAdapterStatus {
 }
 
 function getSupabaseHeaders(prefer?: string): Record<string, string> {
-  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const key = getSupabaseServiceKey();
   const headers: Record<string, string> = {
     apikey: key,
     Authorization: `Bearer ${key}`,
@@ -519,71 +536,62 @@ export async function saveDatabaseToSupabase(
 
     const validUserIds = new Set(deduplicatedUsers.map((u) => u.id));
 
-    // 2. Upsert sessions for existing users
+    // 2. Upsert conversations and sessions in parallel
     const validSessions = data.sessions.filter((s) => validUserIds.has(s.userId));
-    await upsertTableRows('lamavi_sessions', validSessions.map(mapSessionToRow), 'token');
+    const validStatuses = data.statuses.filter((s) => validUserIds.has(s.userId));
+    await Promise.all([
+      upsertTableRows('lamavi_sessions', validSessions.map(mapSessionToRow), 'token'),
+      upsertTableRows('lamavi_conversations', data.conversations.map(mapConversationToRow), 'id'),
+      upsertTableRows('lamavi_statuses', validStatuses.map(mapStatusToRow), 'id'),
+    ]);
 
-    // 3. Upsert conversations
-    await upsertTableRows(
-      'lamavi_conversations',
-      data.conversations.map(mapConversationToRow),
-      'id'
-    );
     const validConvIds = new Set(data.conversations.map((c) => c.id));
+    const validStatusIds = new Set(validStatuses.map((s) => s.id));
 
-    // 4. Upsert messages referencing valid conversations and senders
+    // 3. Upsert messages, status views, contacts, blocks, and reports in parallel
     const validMessages = data.messages.filter(
       (m) => validConvIds.has(m.conversationId) && validUserIds.has(m.senderId)
     );
-    await upsertTableRows('lamavi_messages', validMessages.map(mapMessageToRow), 'id');
+    const validStatusViews = data.statusViews.filter(
+      (sv) => validStatusIds.has(sv.statusId) && validUserIds.has(sv.viewerId)
+    );
+    const validContacts = data.contacts.filter(
+      (c) => validUserIds.has(c.userId) && validUserIds.has(c.contactUserId)
+    );
+    const validBlocks = data.blocks.filter(
+      (b) => validUserIds.has(b.blockerId) && validUserIds.has(b.blockedUserId)
+    );
+    const validReports = data.reports.filter(
+      (rp) => validUserIds.has(rp.reporterId) && validUserIds.has(rp.reportedUserId)
+    );
 
-    // 5. Upsert media (one row at a time when syncMedia=true so large base64 payloads never exceed PostgREST limits)
+    await Promise.all([
+      upsertTableRows('lamavi_messages', validMessages.map(mapMessageToRow), 'id'),
+      upsertTableRows(
+        'lamavi_status_views',
+        validStatusViews.map(mapStatusViewToRow),
+        'status_id,viewer_id'
+      ),
+      upsertTableRows(
+        'lamavi_contacts',
+        validContacts.map(mapContactToRow),
+        'user_id,contact_user_id'
+      ),
+      upsertTableRows(
+        'lamavi_blocks',
+        validBlocks.map(mapBlockToRow),
+        'blocker_id,blocked_user_id'
+      ),
+      upsertTableRows('lamavi_reports', validReports.map(mapReportToRow), 'id'),
+    ]);
+
+    // 4. Upsert media (one row at a time when syncMedia=true so large base64 payloads never exceed PostgREST limits)
     if (syncMedia && data.media.length > 0) {
       const validMedia = data.media.filter((m) => validUserIds.has(m.ownerId));
       for (const m of validMedia) {
         await upsertTableRows('lamavi_media', [mapMediaToRow(m)], 'id');
       }
     }
-
-    // 6. Upsert statuses & status views
-    const validStatuses = data.statuses.filter((s) => validUserIds.has(s.userId));
-    await upsertTableRows('lamavi_statuses', validStatuses.map(mapStatusToRow), 'id');
-
-    const validStatusIds = new Set(validStatuses.map((s) => s.id));
-    const validStatusViews = data.statusViews.filter(
-      (sv) => validStatusIds.has(sv.statusId) && validUserIds.has(sv.viewerId)
-    );
-    await upsertTableRows(
-      'lamavi_status_views',
-      validStatusViews.map(mapStatusViewToRow),
-      'status_id,viewer_id'
-    );
-
-    // 7. Upsert contacts using composite unique constraint (user_id,contact_user_id)
-    const validContacts = data.contacts.filter(
-      (c) => validUserIds.has(c.userId) && validUserIds.has(c.contactUserId)
-    );
-    await upsertTableRows(
-      'lamavi_contacts',
-      validContacts.map(mapContactToRow),
-      'user_id,contact_user_id'
-    );
-
-    // 8. Upsert blocks using composite unique constraint (blocker_id,blocked_user_id)
-    const validBlocks = data.blocks.filter(
-      (b) => validUserIds.has(b.blockerId) && validUserIds.has(b.blockedUserId)
-    );
-    await upsertTableRows(
-      'lamavi_blocks',
-      validBlocks.map(mapBlockToRow),
-      'blocker_id,blocked_user_id'
-    );
-
-    // 9. Upsert reports
-    const validReports = data.reports.filter(
-      (rp) => validUserIds.has(rp.reporterId) && validUserIds.has(rp.reportedUserId)
-    );
-    await upsertTableRows('lamavi_reports', validReports.map(mapReportToRow), 'id');
 
     lastSupabaseSyncedAt = new Date().toISOString();
     lastSupabaseError = null;

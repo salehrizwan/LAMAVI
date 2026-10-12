@@ -1,8 +1,30 @@
 {
-  "rewrites": [
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 30
+    }
+  },
+  "headers": [
     {
       "source": "/api/(.*)",
-      "destination": "/api"
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate"
+        }
+      ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api?__vercel_path=:path*"
+    },
+    {
+      "source": "/((?!api/|sw\\.js|workbox-.*|manifest\\.webmanifest).*)",
+      "destination": "/index.html"
     }
   ]
 }
+
+

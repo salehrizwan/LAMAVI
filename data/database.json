@@ -12,7 +12,7 @@
       "bio": "",
       "avatarUrl": "",
       "createdAt": "2026-10-11T19:52:46.192+00:00",
-      "lastSeen": "2026-10-12T01:40:46.756+00:00",
+      "lastSeen": "2026-10-12T01:55:38.957+00:00",
       "isOnline": false,
       "usernameChangeTimestamps": [],
       "privacy": {
@@ -245,7 +245,7 @@
         "usr_c6c728588e1acd4f"
       ],
       "createdAt": "2026-10-12T01:13:24.756+00:00",
-      "updatedAt": "2026-10-12T01:28:01.27+00:00",
+      "updatedAt": "2026-10-12T01:50:38.031+00:00",
       "deletedBy": [],
       "clearedAt": {}
     },
@@ -422,7 +422,8 @@
       "text": "hi",
       "createdAt": "2026-10-12T01:28:01.27+00:00",
       "expiresAt": "2026-10-19T01:28:01.27+00:00",
-      "status": "sent",
+      "status": "delivered",
+      "deliveredAt": "2026-10-12T01:56:08.128Z",
       "deletedFor": [],
       "deletedForEveryone": false
     },
@@ -437,6 +438,34 @@
       "expiresAt": "2026-10-19T01:35:46.166+00:00",
       "status": "delivered",
       "deliveredAt": "2026-10-12T01:38:22.025+00:00",
+      "deletedFor": [],
+      "deletedForEveryone": false
+    },
+    {
+      "id": "msg_344d12ae8a4d967c",
+      "clientTempId": "temp_1791769783245_3ffsh4",
+      "conversationId": "conv_f6dde9f74ab25626",
+      "senderId": "usr_c6c728588e1acd4f",
+      "recipientId": "usr_055a7bef816c636d",
+      "text": "bro",
+      "createdAt": "2026-10-12T01:50:33.755+00:00",
+      "expiresAt": "2026-10-19T01:50:33.755+00:00",
+      "status": "delivered",
+      "deliveredAt": "2026-10-12T01:56:08.128Z",
+      "deletedFor": [],
+      "deletedForEveryone": false
+    },
+    {
+      "id": "msg_5d95c2ad92f5bc18",
+      "clientTempId": "temp_1791769787733_9djt7i",
+      "conversationId": "conv_f6dde9f74ab25626",
+      "senderId": "usr_c6c728588e1acd4f",
+      "recipientId": "usr_055a7bef816c636d",
+      "text": "listen",
+      "createdAt": "2026-10-12T01:50:38.031+00:00",
+      "expiresAt": "2026-10-19T01:50:38.031+00:00",
+      "status": "delivered",
+      "deliveredAt": "2026-10-12T01:56:08.128Z",
       "deletedFor": [],
       "deletedForEveryone": false
     }

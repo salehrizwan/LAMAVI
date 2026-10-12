@@ -10,3 +10,5 @@ export {
   loadDatabaseFromSupabase,
   saveDatabaseToSupabase,
 } from './supabaseAdapter';
+
+

@@ -159,9 +159,18 @@ export default function App() {
     if (!token || !currentUser) return;
     try {
       const [convRes, statusRes, contactsRes] = await Promise.all([
-        fetch('/api/conversations', { headers: { Authorization: `Bearer ${token}` } }),
-        fetch('/api/statuses', { headers: { Authorization: `Bearer ${token}` } }),
-        fetch('/api/contacts', { headers: { Authorization: `Bearer ${token}` } }),
+        fetch('/api/conversations', {
+          cache: 'no-store',
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch('/api/statuses', {
+          cache: 'no-store',
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch('/api/contacts', {
+          cache: 'no-store',
+          headers: { Authorization: `Bearer ${token}` },
+        }),
       ]);
 
       if (convRes.status === 401) {
@@ -216,6 +225,7 @@ export default function App() {
           ? `?recipientId=${encodeURIComponent(activeConvObj.recipient.id)}`
           : '';
         const res = await fetch(`/api/conversations/${convId}/messages${recipientParam}`, {
+          cache: 'no-store',
           headers: { Authorization: `Bearer ${token}` },
         });
         if (res.ok) {
@@ -302,6 +312,10 @@ export default function App() {
 
   useEffect(() => {
     if (!token || !currentUser || !isOnline) return;
+    // Skip WebSocket connection on Vercel serverless deployments (which do not support stateful WS upgrades and use 2.5s HTTP polling instead)
+    if (typeof window !== 'undefined' && window.location.hostname.endsWith('.vercel.app')) {
+      return;
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;

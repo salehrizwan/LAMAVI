@@ -48,7 +48,13 @@ export default defineConfig(() => {
           clientsClaim: true,
           cleanupOutdatedCaches: true,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-          navigateFallbackDenylist: [/^\/api\//],
+          navigateFallbackDenylist: [/^\/api\//, /^\/api$/],
+          runtimeCaching: [
+            {
+              urlPattern: /^\/api(\/.*)?$/,
+              handler: 'NetworkOnly',
+            },
+          ],
         },
         devOptions: {
           enabled: false,

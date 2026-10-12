@@ -246,7 +246,15 @@ function cleanParsedDatabase(parsed: DatabaseSchema): DatabaseSchema {
   return parsed;
 }
 
-import seedDatabaseRaw from '../data/seed_database.json';
+let seedDatabaseRaw: DatabaseSchema = createEmptyDb();
+try {
+  const seedPath = path.resolve(process.cwd(), 'data', 'seed_database.json');
+  if (fs.existsSync(seedPath)) {
+    seedDatabaseRaw = JSON.parse(fs.readFileSync(seedPath, 'utf-8')) as DatabaseSchema;
+  }
+} catch {
+  seedDatabaseRaw = createEmptyDb();
+}
 
 function loadLocalDatabase(): DatabaseSchema {
   if (getActiveDbProvider() === 'supabase') {
@@ -600,8 +608,6 @@ export async function saveDatabase(
   return { ok: true, cloudPersisted: true };
 }
 
-ensureCloudDatabaseLoaded(true);
-
 function hashSecret(
   secret: string,
   salt?: string
@@ -822,6 +828,88 @@ export function createApiApp(
 ) {
   const app = express();
   app.use(express.json({ limit: '12mb' }));
+
+  // Normalize Vercel rewritten URLs (`/api/index.ts?__vercel_path=...` or `/api?path=...`) back to `/api/...`
+  app.use((req, res, next) => {
+    res.setHeader(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, proxy-revalidate'
+    );
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    const forwardedUri =
+      (typeof req.headers['x-vercel-forwarded-url'] === 'string' &&
+        req.headers['x-vercel-forwarded-url']) ||
+      (typeof req.headers['x-forwarded-uri'] === 'string' &&
+        req.headers['x-forwarded-uri']) ||
+      '';
+
+    const parsedUrl = new URL(req.url || '/', 'http://localhost');
+    const vercelPathParam =
+      parsedUrl.searchParams.get('__vercel_path') ||
+      parsedUrl.searchParams.get('path') ||
+      '';
+
+    if (
+      (parsedUrl.pathname === '/api' ||
+        parsedUrl.pathname === '/api/' ||
+        parsedUrl.pathname === '/api/index' ||
+        parsedUrl.pathname === '/api/index.ts' ||
+        parsedUrl.pathname === '/api/index.js') &&
+      vercelPathParam
+    ) {
+      parsedUrl.searchParams.delete('__vercel_path');
+      parsedUrl.searchParams.delete('path');
+      const cleanSubPath = vercelPathParam.replace(/^\/+/, '');
+      const qs = parsedUrl.searchParams.toString();
+      req.url = `/api/${cleanSubPath}${qs ? `?${qs}` : ''}`;
+    } else if (
+      (parsedUrl.pathname === '/api' ||
+        parsedUrl.pathname === '/api/' ||
+        parsedUrl.pathname === '/api/index' ||
+        parsedUrl.pathname === '/api/index.ts' ||
+        parsedUrl.pathname === '/api/index.js') &&
+      forwardedUri.startsWith('/api/')
+    ) {
+      req.url = forwardedUri;
+    } else if (!req.url.startsWith('/api/') && req.url !== '/api') {
+      req.url = `/api${req.url.startsWith('/') ? '' : '/'}${req.url}`;
+    }
+
+    if (process.env.VERCEL || process.env.LAMAVI_DEBUG_API === 'true') {
+      const safePath = req.url.split('?')[0];
+      res.on('finish', () => {
+        console.log(
+          `[LAMAVI API] ${req.method} ${safePath} -> ${res.statusCode} (provider=${getActiveDbProvider()})`
+        );
+      });
+    }
+
+    next();
+  });
+
+  app.get(['/api/health', '/api'], async (_req, res) => {
+    await ensureCloudDatabaseLoaded(true);
+    const status = getSupabaseAdapterStatus();
+    res.json({
+      ok: true,
+      service: 'lamavi-api',
+      vercel: Boolean(process.env.VERCEL),
+      provider: status.provider,
+      supabaseConfigured: status.configured,
+      supabaseActive: status.active,
+      supabaseUrlConfigured: status.supabaseUrlConfigured,
+      serviceRoleKeyConfigured: status.serviceRoleKeyConfigured,
+      lastSyncedAt: status.lastSyncedAt,
+      lastError: status.lastError,
+      counts: {
+        users: db.users.length,
+        conversations: db.conversations.length,
+        messages: db.messages.length,
+      },
+    });
+  });
 
   function resolveUserFromToken(token: string): UserRecord | null {
     if (!token) return null;
@@ -2659,6 +2747,10 @@ export function createApiApp(
   return app;
 }
 
-// Export default Express app for Vercel Serverless Functions (`/api/index.ts`)
-const vercelApp = createApiApp();
-export default vercelApp;
+// Export default Serverless Function handler for Vercel (`/api/index.ts`)
+export const vercelApp = createApiApp();
+
+export default function handler(req: express.Request, res: express.Response) {
+  return vercelApp(req, res);
+}
+
