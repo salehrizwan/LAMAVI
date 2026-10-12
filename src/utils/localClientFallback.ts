@@ -479,6 +479,7 @@ export function installLocalFallbackInterceptor() {
     }
     const nextInit: RequestInit = {
       ...init,
+      credentials: init?.credentials || 'same-origin',
       headers: mergedHeaders,
     };
 
@@ -632,7 +633,8 @@ export function installLocalFallbackInterceptor() {
         }
         return response;
       }
-      return response;
+      // If the response for `/api/*` is NOT JSON (e.g., an HTML proxy challenge or 404/502 page on mobile),
+      // fall through to `handleFallbackApiRequest` rather than returning non-JSON HTML to the caller.
     } catch {
       // Network error reaching `/api/*` -> fall through to local handler
     }
@@ -741,29 +743,72 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
         error: 'Username must be 3–24 characters using letters, numbers, underscores, or periods.',
       });
     }
-    if (state.users.some((u) => u.username.toLowerCase() === cleanUsername)) {
-      return jsonResponse(409, { error: 'This username is already taken. Please choose another.' });
-    }
     const cleanEmail = String(email || '').trim().toLowerCase();
     if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       return jsonResponse(400, { error: 'A valid Gmail / email address is required.' });
     }
-    if (state.users.some((u) => u.email.toLowerCase() === cleanEmail)) {
-      return jsonResponse(409, { error: 'An account with this email address already exists.' });
-    }
+    const cleanPw = typeof password === 'string' ? password.trim() : '';
     if (
-      typeof password !== 'string' ||
-      password.length !== 8 ||
-      !/[a-zA-Z]/.test(password) ||
-      !/[0-9]/.test(password)
+      cleanPw.length !== 8 ||
+      !/[a-zA-Z]/.test(cleanPw) ||
+      !/[0-9]/.test(cleanPw)
     ) {
       return jsonResponse(400, {
         error: 'Password must be 8 characters with at least one letter and one digit.',
       });
     }
 
+    const firstLowerPw =
+      cleanPw.length > 0 ? cleanPw[0].toLowerCase() + cleanPw.slice(1) : cleanPw;
+    const firstUpperPw =
+      cleanPw.length > 0 ? cleanPw[0].toUpperCase() + cleanPw.slice(1) : cleanPw;
+    const pwCandidates = await Promise.all([
+      sha256Hex(cleanPw),
+      sha256Hex(cleanPw.toLowerCase()),
+      sha256Hex(cleanPw.toUpperCase()),
+      sha256Hex(firstLowerPw),
+      sha256Hex(firstUpperPw),
+    ]);
+
+    const existingByUsername = state.users.find((u) => u.username.toLowerCase() === cleanUsername);
+    const existingByEmail = state.users.find((u) => u.email.toLowerCase() === cleanEmail);
+    const existingUser = existingByUsername || existingByEmail;
+
+    if (existingUser) {
+      if (
+        (!existingByUsername || !existingByEmail || existingByUsername.id === existingByEmail.id) &&
+        pwCandidates.includes(existingUser.passwordDigest)
+      ) {
+        const now = new Date().toISOString();
+        const recoveryCode = generateClientRecoveryCode();
+        existingUser.fullName = String(fullName).trim();
+        existingUser.username = cleanUsername;
+        existingUser.email = cleanEmail;
+        existingUser.passwordDigest = await sha256Hex(cleanPw);
+        existingUser.recoveryDigest = await sha256Hex(recoveryCode);
+        existingUser.lastSeen = now;
+        existingUser.isOnline = true;
+        const newToken = `lmv.${existingUser.id}.${randomHex(24)}`;
+        state.sessions[newToken] = existingUser.id;
+        writeLocalState(state);
+        return jsonResponse(201, {
+          token: newToken,
+          user: toUserProfile(existingUser, existingUser.id, state),
+          recoveryCode,
+        });
+      }
+      if (existingByUsername) {
+        return jsonResponse(409, {
+          error: 'This username is already taken. Please log in or choose another username.',
+        });
+      }
+      return jsonResponse(409, {
+        error: 'An account with this email address already exists. Please log in instead.',
+      });
+    }
+
     const recoveryCode = generateClientRecoveryCode();
-    const passwordDigest = await sha256Hex(password.trim());
+    const passwordDigest = await sha256Hex(cleanPw);
     const recoveryDigest = await sha256Hex(recoveryCode);
     const now = new Date().toISOString();
 
@@ -811,11 +856,18 @@ async function handleFallbackApiRequest(urlStr: string, init?: RequestInit): Pro
       .toLowerCase()
       .replace(/^@/, '');
     const rawPw = String(password || '');
+    const trimmedPw = rawPw.trim();
+    const firstLowerPw =
+      trimmedPw.length > 0 ? trimmedPw[0].toLowerCase() + trimmedPw.slice(1) : trimmedPw;
+    const firstUpperPw =
+      trimmedPw.length > 0 ? trimmedPw[0].toUpperCase() + trimmedPw.slice(1) : trimmedPw;
     const pwCandidates = await Promise.all([
       sha256Hex(rawPw),
-      sha256Hex(rawPw.trim()),
-      sha256Hex(rawPw.trim().toLowerCase()),
-      sha256Hex(rawPw.trim().toUpperCase()),
+      sha256Hex(trimmedPw),
+      sha256Hex(trimmedPw.toLowerCase()),
+      sha256Hex(trimmedPw.toUpperCase()),
+      sha256Hex(firstLowerPw),
+      sha256Hex(firstUpperPw),
     ]);
     const user = state.users.find((u) => {
       const uname = u.username.toLowerCase();

@@ -620,12 +620,26 @@ function verifySecret(
   secret: string,
   salt: string,
   expectedHash: string,
-  allowCaseInsensitive = false
+  allowCaseInsensitive = true
 ): boolean {
   if (!expectedHash || typeof secret !== 'string') return false;
+  const trimmed = secret.trim();
+  const firstLower =
+    trimmed.length > 0 ? trimmed[0].toLowerCase() + trimmed.slice(1) : trimmed;
+  const firstUpper =
+    trimmed.length > 0 ? trimmed[0].toUpperCase() + trimmed.slice(1) : trimmed;
   const candidates = allowCaseInsensitive
-    ? [secret, secret.trim(), secret.trim().toUpperCase(), secret.trim().toLowerCase()]
-    : [secret];
+    ? Array.from(
+        new Set([
+          secret,
+          trimmed,
+          trimmed.toLowerCase(),
+          trimmed.toUpperCase(),
+          firstLower,
+          firstUpper,
+        ])
+      )
+    : [secret, trimmed];
 
   for (const candidate of candidates) {
     // 1. Check SHA-256 hex digest
@@ -883,13 +897,6 @@ export function createApiApp(
       return;
     }
 
-    if (db.users.some((u) => u.username.toLowerCase() === cleanUsername)) {
-      res.status(409).json({
-        error: 'This username is already taken. Please choose another.',
-      });
-      return;
-    }
-
     const cleanEmail =
       typeof email === 'string' ? email.trim().toLowerCase() : '';
     if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
@@ -900,22 +907,76 @@ export function createApiApp(
       return;
     }
 
-    if (
-      db.users.some((u) => u.email && u.email.toLowerCase() === cleanEmail)
-    ) {
-      res.status(409).json({
-        error: 'An account with this email address already exists.',
-      });
-      return;
-    }
-
-    const pwError = validatePasswordRules(password);
+    const cleanPassword =
+      typeof password === 'string' ? password.trim() : '';
+    const pwError = validatePasswordRules(cleanPassword);
     if (pwError) {
       res.status(400).json({ error: pwError });
       return;
     }
 
-    const { salt: passwordSalt, hash: passwordHash } = hashSecret(password);
+    const existingByUsername = db.users.find(
+      (u) => u.username.toLowerCase() === cleanUsername
+    );
+    const existingByEmail = db.users.find(
+      (u) => u.email && u.email.toLowerCase() === cleanEmail
+    );
+    const existingUser = existingByUsername || existingByEmail;
+
+    if (existingUser) {
+      // If the user is re-registering their own existing account with the matching password (e.g. after a mobile retry),
+      // authenticate them and issue a fresh session + recovery code rather than blocking them.
+      if (
+        (!existingByUsername || !existingByEmail || existingByUsername.id === existingByEmail.id) &&
+        verifySecret(cleanPassword, existingUser.passwordSalt, existingUser.passwordHash)
+      ) {
+        const now = new Date().toISOString();
+        existingUser.fullName = fullName.trim();
+        existingUser.username = cleanUsername;
+        existingUser.email = cleanEmail;
+        existingUser.lastSeen = now;
+        existingUser.isOnline = true;
+        const upgraded = hashSecret(cleanPassword, 'sha256_client');
+        existingUser.passwordSalt = upgraded.salt;
+        existingUser.passwordHash = upgraded.hash;
+        const plainRecoveryCode = generateRecoveryCode();
+        const recHash = hashSecret(plainRecoveryCode, 'sha256_client');
+        existingUser.recoveryCodeSalt = recHash.salt;
+        existingUser.recoveryCodeHash = recHash.hash;
+
+        const token = `lmv.${existingUser.id}.${crypto.randomBytes(24).toString('hex')}`;
+        const expiresAt = new Date(
+          Date.now() + 1000 * 60 * 60 * 24 * 30
+        ).toISOString();
+        db.sessions.push({
+          token,
+          userId: existingUser.id,
+          createdAt: now,
+          expiresAt,
+        });
+        await saveDatabase();
+        res.status(201).json({
+          token,
+          user: sanitizeUserForViewer(existingUser, existingUser.id),
+          recoveryCode: plainRecoveryCode,
+          cloudPersisted: true,
+        });
+        return;
+      }
+
+      if (existingByUsername) {
+        res.status(409).json({
+          error: 'This username is already taken. Please log in or choose another username.',
+        });
+        return;
+      }
+      res.status(409).json({
+        error: 'An account with this email address already exists. Please log in instead.',
+      });
+      return;
+    }
+
+    const { salt: passwordSalt, hash: passwordHash } = hashSecret(cleanPassword);
     const plainRecoveryCode = generateRecoveryCode();
     const { salt: recoveryCodeSalt, hash: recoveryCodeHash } =
       hashSecret(plainRecoveryCode);
@@ -1419,6 +1480,7 @@ export function createApiApp(
 
   // --- CONTACTS, UNCONNECT, BLOCKING, AND REPORTING ---
   app.get('/api/contacts', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
 
     // Contacts are strictly users that the current user has explicitly connected with
@@ -1485,6 +1547,7 @@ export function createApiApp(
   });
 
   app.post('/api/contacts/remove', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId } = req.body || {};
 
@@ -1510,6 +1573,7 @@ export function createApiApp(
   });
 
   app.post('/api/users/block', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId } = req.body || {};
     if (!targetUserId || targetUserId === user.id) {
@@ -1532,6 +1596,7 @@ export function createApiApp(
   });
 
   app.post('/api/users/unblock', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId } = req.body || {};
     db.blocks = db.blocks.filter(
@@ -1548,6 +1613,7 @@ export function createApiApp(
   });
 
   app.post('/api/users/report', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const { targetUserId, reason, details } = req.body || {};
     if (!targetUserId || !reason) {
@@ -1573,6 +1639,7 @@ export function createApiApp(
 
   // --- SECURE MEDIA UPLOAD & ACCESS (7-DAY RETENTION) ---
   app.post('/api/media', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const { dataBase64, mimeType, conversationId, statusId } = req.body || {};
 
@@ -2298,6 +2365,7 @@ export function createApiApp(
   });
 
   app.post('/api/statuses', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     purgeExpiredRecords();
     const user = (req as express.Request & { user: UserRecord }).user;
     const { type, text, backgroundColor, textColor, imageId, privacy } =
@@ -2359,6 +2427,7 @@ export function createApiApp(
   });
 
   app.post('/api/statuses/:statusId/view', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const status = db.statuses.find((s) => s.id === req.params.statusId);
     if (!status) {
@@ -2391,6 +2460,7 @@ export function createApiApp(
   });
 
   app.delete('/api/statuses/:statusId', requireAuth, async (req, res) => {
+    await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
     const status = db.statuses.find((s) => s.id === req.params.statusId);
     if (!status || status.userId !== user.id) {

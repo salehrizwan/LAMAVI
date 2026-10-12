@@ -42,7 +42,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  const activePw = mode === 'register' ? password : recNewPassword;
+  const activePw = (mode === 'register' ? password : recNewPassword).trim();
   const isExactly8 = activePw.length === 8;
   const hasLetter = /[a-zA-Z]/.test(activePw);
   const hasDigit = /[0-9]/.test(activePw);
@@ -59,7 +59,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
-    if (!loginIdentifier.trim() || !loginPassword) {
+    if (!loginIdentifier.trim() || !loginPassword.trim()) {
       setErrorMsg('Please enter your username or Gmail address and password.');
       return;
     }
@@ -68,15 +68,16 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           identifier: loginIdentifier.trim(),
-          password: loginPassword,
+          password: loginPassword.trim(),
         }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setErrorMsg(sanitizeAuthErrorMessage(data.error, 'Incorrect username/Gmail or password.'));
+      if (!res.ok || !data?.token || !data?.user) {
+        setErrorMsg(sanitizeAuthErrorMessage(data?.error, 'Incorrect username/Gmail or password.'));
       } else {
         onAuthenticated(data.token, data.user);
       }
@@ -115,7 +116,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       setErrorMsg('Password must contain at least one numerical digit.');
       return;
     }
-    if (password !== confirmPassword) {
+    if (password.trim() !== confirmPassword.trim()) {
       setErrorMsg('Password confirmation does not match.');
       return;
     }
@@ -124,17 +125,18 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fullName: fullName.trim(),
           username: username.trim().toLowerCase(),
           email: email.trim().toLowerCase(),
-          password,
+          password: password.trim(),
         }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setErrorMsg(sanitizeAuthErrorMessage(data.error, 'Account creation failed.'));
+      if (!res.ok || !data?.token || !data?.user) {
+        setErrorMsg(sanitizeAuthErrorMessage(data?.error, 'Account creation failed.'));
       } else {
         setCreatedSession({
           token: data.token,
@@ -335,6 +337,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     onChange={(e) => setLoginIdentifier(e.target.value)}
                     placeholder="Enter your username or Gmail"
                     autoComplete="username"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
                     className="w-full h-11 px-4 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none transition-colors"
                   />
                 </div>
@@ -360,6 +365,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                       onChange={(e) => setLoginPassword(e.target.value)}
                       placeholder="8-character password"
                       autoComplete="current-password"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
                       className="w-full h-11 pl-4 pr-11 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none transition-colors"
                     />
                     <button
@@ -425,6 +433,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                       setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_.]/g, ''))
                     }
                     placeholder="your_username"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
                     className="w-full h-11 px-3.5 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none transition-colors"
                   />
                 </div>
@@ -439,6 +450,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     placeholder="yourname@gmail.com"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
                     className="w-full h-11 px-3.5 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none transition-colors"
                   />
                 </div>
@@ -455,6 +469,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       placeholder="Exactly 8 characters"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
                       className="w-full h-11 pl-3.5 pr-11 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none transition-colors"
                     />
                     <button
@@ -473,7 +490,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                       }`}
                     >
                       <Check className="w-3.5 h-3.5 shrink-0" />
-                      <span>Exactly 8 characters ({password.length}/8)</span>
+                      <span>Exactly 8 characters ({activePw.length}/8)</span>
                     </div>
                     <div
                       className={`flex items-center gap-1.5 ${
@@ -506,6 +523,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
                       placeholder="Re-enter 8-character password"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
                       className="w-full h-11 pl-3.5 pr-11 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none transition-colors"
                     />
                     <button

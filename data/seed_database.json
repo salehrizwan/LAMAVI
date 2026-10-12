@@ -1,6 +1,53 @@
 {
-  "users": [],
-  "sessions": [],
+  "users": [
+    {
+      "id": "usr_c6c728588e1acd4f",
+      "fullName": "Saleh Rizwan",
+      "username": "saima123",
+      "email": "salehrizwan6@gmail.com",
+      "passwordSalt": "sha256_client",
+      "passwordHash": "2d52cc0d1bdec595883ad293362889fbcc856810f0333ed1eea0f21788716589",
+      "recoveryCodeSalt": "sha256_client",
+      "recoveryCodeHash": "a4346b131acaad0e52e6090264735751be558db4ac541d9caa01b0c98644ee75",
+      "bio": "",
+      "avatarUrl": "",
+      "createdAt": "2026-10-11T19:52:46.192+00:00",
+      "lastSeen": "2026-10-11T20:07:35.674+00:00",
+      "isOnline": false,
+      "usernameChangeTimestamps": [],
+      "privacy": {
+        "readReceipts": true,
+        "statusPrivacy": "everyone",
+        "whoCanContact": "everyone",
+        "lastSeenVisibility": "everyone",
+        "profilePicVisibility": "everyone"
+      },
+      "notifications": {
+        "previewText": true,
+        "soundEnabled": true,
+        "messageAlerts": true
+      },
+      "chatSettings": {
+        "fontSize": "medium",
+        "enterToSend": true,
+        "autoDownloadImages": true
+      }
+    }
+  ],
+  "sessions": [
+    {
+      "token": "lmv.usr_c6c728588e1acd4f.c43167f883e9974be099116bad602f22d698a40f87dd1c26",
+      "userId": "usr_c6c728588e1acd4f",
+      "createdAt": "2026-10-11T19:52:46.192+00:00",
+      "expiresAt": "2026-11-10T19:52:46.192+00:00"
+    },
+    {
+      "token": "lmv.usr_c6c728588e1acd4f.b386b7f3912657d97544fa4956a0a9276aa6a5ae1c8a5712",
+      "userId": "usr_c6c728588e1acd4f",
+      "createdAt": "2026-10-11T19:54:44.457+00:00",
+      "expiresAt": "2026-11-10T19:54:44.457+00:00"
+    }
+  ],
   "conversations": [],
   "messages": [],
   "media": [],
