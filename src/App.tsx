@@ -615,6 +615,7 @@ export default function App() {
 
       const res = await fetch(`/api/conversations/${conversationId}/messages`, {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
@@ -630,24 +631,31 @@ export default function App() {
       });
 
       const payload = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(payload.error || `Message send failed (HTTP ${res.status})`);
+      if (!res.ok || !payload?.message) {
+        throw new Error(payload?.error || `Message send failed (HTTP ${res.status})`);
       }
       const { message: confirmedMsg } = payload;
+      const canonicalConvId = confirmedMsg.conversationId || conversationId;
 
       setMessagesByConv((prev) => {
-        const list = (prev[conversationId] || []).filter(
+        const list = (prev[canonicalConvId] || prev[conversationId] || []).filter(
           (m) => m.clientTempId !== clientTempId && m.id !== confirmedMsg.id
+        );
+        const sorted = [...list, confirmedMsg].sort((a, b) =>
+          a.createdAt.localeCompare(b.createdAt)
         );
         const next = {
           ...prev,
-          [conversationId]: [...list, confirmedMsg].sort((a, b) =>
-            a.createdAt.localeCompare(b.createdAt)
-          ),
+          [canonicalConvId]: sorted,
+          [conversationId]: sorted,
         };
         saveCache(currentUser.id, 'msgs', next);
         return next;
       });
+
+      if (canonicalConvId !== conversationId && selectedConvId === conversationId) {
+        setSelectedConvId(canonicalConvId);
+      }
 
       fetchAllData();
     } catch (err) {
@@ -677,11 +685,11 @@ export default function App() {
 
   const handleStartConversation = async (targetUser: UserProfile) => {
     if (!token || !isOnline || !currentUser) return;
-    setShowUserSearchModal(false);
 
     try {
       const res = await fetch('/api/conversations/start', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
@@ -690,9 +698,11 @@ export default function App() {
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.conversation) {
+        setShowUserSearchModal(false);
         await fetchAllData();
         setActiveTab('chats');
         setSelectedConvId(data.conversation.id);
+        await fetchConversationMessages(data.conversation.id);
         return;
       }
     } catch {

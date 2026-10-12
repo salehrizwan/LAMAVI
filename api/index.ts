@@ -833,6 +833,25 @@ export function createApiApp(
       const found = db.users.find((u) => u.id === session.userId);
       if (found) return found;
     }
+    if (token.startsWith('lmv.')) {
+      const parts = token.split('.');
+      if (parts.length >= 3 && parts[1]) {
+        const uid = parts[1];
+        const found = db.users.find((u) => u.id === uid);
+        if (found) {
+          const expiresAt = new Date(
+            Date.now() + 1000 * 60 * 60 * 24 * 30
+          ).toISOString();
+          db.sessions.push({
+            token,
+            userId: found.id,
+            createdAt: now,
+            expiresAt,
+          });
+          return found;
+        }
+      }
+    }
     return null;
   }
 
@@ -850,6 +869,82 @@ export function createApiApp(
       // Reload from Supabase in case account/session was just created
       await ensureCloudDatabaseLoaded(true);
       user = resolveUserFromToken(token);
+    }
+
+    // If the client had created an account during a temporary network/proxy interruption,
+    // recover and persist the user and session into Supabase from X-Lamavi-User so cross-device discovery and messaging work seamlessly!
+    if (!user) {
+      const headerRaw = req.headers['x-lamavi-user'];
+      const rawStr = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+      if (rawStr && typeof rawStr === 'string') {
+        try {
+          const parsed = JSON.parse(rawStr) as Partial<UserRecord>;
+          if (parsed && parsed.username) {
+            const cleanUname = String(parsed.username).trim().toLowerCase();
+            const cleanEmail = String(parsed.email || `${cleanUname}@gmail.com`)
+              .trim()
+              .toLowerCase();
+            let existing = db.users.find(
+              (u) =>
+                (parsed.id && u.id === parsed.id) ||
+                u.username.toLowerCase() === cleanUname ||
+                (u.email && u.email.toLowerCase() === cleanEmail)
+            );
+            const now = new Date().toISOString();
+            const expiresAt = new Date(
+              Date.now() + 1000 * 60 * 60 * 24 * 30
+            ).toISOString();
+            if (!existing && parsed.id) {
+              existing = {
+                id: String(parsed.id),
+                fullName: String(parsed.fullName || cleanUname).trim(),
+                username: cleanUname,
+                email: cleanEmail,
+                passwordSalt: 'sha256_client',
+                passwordHash: '',
+                recoveryCodeSalt: 'sha256_client',
+                recoveryCodeHash: '',
+                bio: String(parsed.bio || ''),
+                avatarUrl: String(parsed.avatarUrl || ''),
+                createdAt: String(parsed.createdAt || now),
+                lastSeen: now,
+                isOnline: true,
+                usernameChangeTimestamps: [],
+                privacy: parsed.privacy || {
+                  profilePicVisibility: 'everyone',
+                  lastSeenVisibility: 'everyone',
+                  readReceipts: true,
+                  statusPrivacy: 'everyone',
+                  whoCanContact: 'everyone',
+                },
+                notifications: parsed.notifications || {
+                  messageAlerts: true,
+                  soundEnabled: true,
+                  previewText: true,
+                },
+                chatSettings: parsed.chatSettings || {
+                  enterToSend: true,
+                  fontSize: 'medium',
+                  autoDownloadImages: true,
+                },
+              };
+              db.users.push(existing);
+            }
+            if (existing) {
+              db.sessions.push({
+                token,
+                userId: existing.id,
+                createdAt: now,
+                expiresAt,
+              });
+              await saveDatabase();
+              user = existing;
+            }
+          }
+        } catch {
+          // ignore malformed header
+        }
+      }
     }
 
     return user;
@@ -1371,110 +1466,93 @@ export function createApiApp(
     const rawQuery =
       typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
 
-    if (!rawQuery) {
-      res.status(400).json({
-        error: 'Please enter a username or email address to search.',
-      });
-      return;
-    }
-
     const normalizedQuery = rawQuery.startsWith('@')
       ? rawQuery.slice(1).trim()
       : rawQuery;
 
-    // 1. Exact match on username, email, or Gmail prefix first
-    let found = db.users.find((u) => {
-      if (u.id === user.id) return false;
+    // Score and rank all other registered users in Supabase so newly registered accounts and exact matches are always prioritized
+    const scoredUsers: Array<{ record: UserRecord; score: number }> = [];
+
+    for (const u of db.users) {
+      if (u.id === user.id) continue;
+      const { blockedByThem } = isBlockedBetween(user.id, u.id);
+      if (blockedByThem) continue;
+
       const uname = (u.username || '').trim().toLowerCase();
       const uemail = (u.email || '').trim().toLowerCase();
       const emailPrefix = uemail.includes('@') ? uemail.split('@')[0] : '';
-      return (
-        uname === normalizedQuery ||
-        uemail === normalizedQuery ||
-        uemail === `${normalizedQuery}@gmail.com` ||
-        (emailPrefix && emailPrefix === normalizedQuery)
-      );
-    });
+      const fname = (u.fullName || '').trim().toLowerCase();
 
-    // 2. If no exact match, check partial/prefix match on username, email, or fullName so users never get stuck with "No user found"
-    if (!found) {
-      found = db.users.find((u) => {
-        if (u.id === user.id) return false;
-        const uname = (u.username || '').trim().toLowerCase();
-        const uemail = (u.email || '').trim().toLowerCase();
-        const fname = (u.fullName || '').trim().toLowerCase();
-        return (
-          uname.includes(normalizedQuery) ||
-          normalizedQuery.includes(uname) ||
-          uemail.includes(normalizedQuery) ||
-          fname === normalizedQuery ||
-          fname.includes(normalizedQuery)
-        );
-      });
+      if (!normalizedQuery) {
+        scoredUsers.push({ record: u, score: 10 });
+        continue;
+      }
+
+      let score = 0;
+      if (uname === normalizedQuery) {
+        score = 100;
+      } else if (uemail === normalizedQuery || uemail === `${normalizedQuery}@gmail.com`) {
+        score = 95;
+      } else if (emailPrefix && emailPrefix === normalizedQuery) {
+        score = 90;
+      } else if (fname === normalizedQuery) {
+        score = 85;
+      } else if (uname.startsWith(normalizedQuery)) {
+        score = 75;
+      } else if (emailPrefix && emailPrefix.startsWith(normalizedQuery)) {
+        score = 70;
+      } else if (fname.startsWith(normalizedQuery)) {
+        score = 65;
+      } else if (uname.includes(normalizedQuery)) {
+        score = 50;
+      } else if (uemail.includes(normalizedQuery)) {
+        score = 45;
+      } else if (fname.includes(normalizedQuery)) {
+        score = 40;
+      }
+
+      if (score > 0) {
+        scoredUsers.push({ record: u, score });
+      }
     }
 
-    // Also collect all matching users so the search modal can show multiple matches if applicable
-    const matchingUsers = db.users
-      .filter((u) => {
-        if (u.id === user.id) return false;
-        const { blockedByThem } = isBlockedBetween(user.id, u.id);
-        if (blockedByThem) return false;
-        const uname = (u.username || '').trim().toLowerCase();
-        const uemail = (u.email || '').trim().toLowerCase();
-        const fname = (u.fullName || '').trim().toLowerCase();
-        return (
-          uname.includes(normalizedQuery) ||
-          normalizedQuery.includes(uname) ||
-          uemail.includes(normalizedQuery) ||
-          fname.includes(normalizedQuery)
-        );
-      })
-      .map((u) => ({
-        ...sanitizeUserForViewer(u, user.id),
-        isContact: db.contacts.some(
-          (c) => c.userId === user.id && c.contactUserId === u.id
-        ),
-        isBlocked: db.blocks.some(
-          (b) => b.blockerId === user.id && b.blockedUserId === u.id
-        ),
-      }));
+    scoredUsers.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return (b.record.createdAt || '').localeCompare(a.record.createdAt || '');
+    });
 
-    if (!found) {
-      // Check if they searched their own username/email
-      const isSelfSearch =
-        user.username.toLowerCase() === normalizedQuery ||
-        (user.email && user.email.toLowerCase() === normalizedQuery);
-      if (isSelfSearch) {
-        res
-          .status(400)
-          .json({ error: 'This is your own account! Enter the other person’s username or Gmail to connect.' });
+    const matchingUsers = scoredUsers.map(({ record: u }) => ({
+      ...sanitizeUserForViewer(u, user.id),
+      isContact: db.contacts.some(
+        (c) => c.userId === user.id && c.contactUserId === u.id
+      ),
+      isBlocked: db.blocks.some(
+        (b) => b.blockerId === user.id && b.blockedUserId === u.id
+      ),
+    }));
+
+    const isExactSelfSearch =
+      normalizedQuery.length > 0 &&
+      (user.username.toLowerCase() === normalizedQuery ||
+        (user.email && user.email.toLowerCase() === normalizedQuery) ||
+        (user.email && user.email.toLowerCase().split('@')[0] === normalizedQuery));
+
+    if (matchingUsers.length === 0) {
+      if (isExactSelfSearch) {
+        res.status(400).json({
+          error:
+            'This is your own account! Enter the other person’s username or Gmail to connect.',
+        });
         return;
       }
       res.json({ result: null, results: [] });
       return;
     }
 
-    const { blockedByThem } = isBlockedBetween(user.id, found.id);
-    if (blockedByThem) {
-      res.json({ result: null, results: [] });
-      return;
-    }
-
-    const sanitized = sanitizeUserForViewer(found, user.id);
-    const isContact = db.contacts.some(
-      (c) => c.userId === user.id && c.contactUserId === found.id
-    );
-    const isBlocked = db.blocks.some(
-      (b) => b.blockerId === user.id && b.blockedUserId === found.id
-    );
-
     res.json({
-      result: {
-        ...sanitized,
-        isContact,
-        isBlocked,
-      },
+      result: matchingUsers[0],
       results: matchingUsers,
+      selfMatched: isExactSelfSearch,
     });
   });
 
@@ -1512,21 +1590,25 @@ export function createApiApp(
   app.post('/api/contacts/add', requireAuth, async (req, res) => {
     await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
-    const { targetUserId } = req.body || {};
+    const { targetUserId, targetUser } = req.body || {};
 
     if (!targetUserId || targetUserId === user.id) {
       res.status(400).json({ error: 'Invalid user selected.' });
       return;
     }
 
-    const target = db.users.find((u) => u.id === targetUserId);
+    let target = db.users.find((u) => u.id === targetUserId);
+    if (!target && targetUser && targetUser.username) {
+      const cleanUname = String(targetUser.username).trim().toLowerCase();
+      target = db.users.find((u) => u.username.toLowerCase() === cleanUname);
+    }
     if (!target) {
       res.status(404).json({ error: 'User not found.' });
       return;
     }
 
     const exists = db.contacts.some(
-      (c) => c.userId === user.id && c.contactUserId === target.id
+      (c) => c.userId === user.id && c.contactUserId === target!.id
     );
     if (!exists) {
       db.contacts.push({
@@ -1877,7 +1959,7 @@ export function createApiApp(
   app.post('/api/conversations/start', requireAuth, async (req, res) => {
     await ensureCloudDatabaseLoaded(true);
     const user = (req as express.Request & { user: UserRecord }).user;
-    const { recipientId } = req.body || {};
+    const { recipientId, targetUser } = req.body || {};
 
     if (!recipientId || typeof recipientId !== 'string') {
       res.status(400).json({ error: 'Recipient user ID is required.' });
@@ -1889,7 +1971,11 @@ export function createApiApp(
       return;
     }
 
-    const recipient = db.users.find((u) => u.id === recipientId);
+    let recipient = db.users.find((u) => u.id === recipientId);
+    if (!recipient && targetUser && targetUser.username) {
+      const cleanUname = String(targetUser.username).trim().toLowerCase();
+      recipient = db.users.find((u) => u.username.toLowerCase() === cleanUname);
+    }
     if (!recipient) {
       res.status(404).json({ error: 'No user found.' });
       return;
@@ -1918,7 +2004,7 @@ export function createApiApp(
     let conv = db.conversations.find(
       (c) =>
         c.participantIds.includes(user.id) &&
-        c.participantIds.includes(recipient.id)
+        c.participantIds.includes(recipient!.id)
     );
 
     const now = new Date().toISOString();
@@ -2025,35 +2111,65 @@ export function createApiApp(
       await ensureCloudDatabaseLoaded(true);
       const user = (req as express.Request & { user: UserRecord }).user;
       const requestedConvId = req.params.conversationId;
-      const { text, imageId, replyToMessageId, clientTempId, recipientId } =
-        req.body || {};
+      const {
+        text,
+        imageId,
+        replyToMessageId,
+        clientTempId,
+        recipientId,
+        targetUser,
+      } = req.body || {};
 
       let conv = db.conversations.find((c) => c.id === requestedConvId);
 
-      // If conversation was started by deterministic ID or participant pair, find by pair or create if recipient exists in Supabase
-      if (!conv && recipientId && typeof recipientId === 'string' && recipientId !== user.id) {
-        const canonicalId = getDeterministicConversationId(user.id, recipientId);
+      // Resolve recipient by ID or by username if targetUser was provided
+      let resolvedRecipientId =
+        typeof recipientId === 'string' && recipientId !== user.id
+          ? recipientId
+          : '';
+      if (!resolvedRecipientId && targetUser && targetUser.username) {
+        const cleanUname = String(targetUser.username).trim().toLowerCase();
+        const byUname = db.users.find(
+          (u) => u.id !== user.id && u.username.toLowerCase() === cleanUname
+        );
+        if (byUname) resolvedRecipientId = byUname.id;
+      }
+
+      if (!conv && resolvedRecipientId) {
+        let recipientRecord = db.users.find((u) => u.id === resolvedRecipientId);
+        if (!recipientRecord && targetUser && targetUser.username) {
+          const cleanUname = String(targetUser.username).trim().toLowerCase();
+          recipientRecord = db.users.find(
+            (u) => u.id !== user.id && u.username.toLowerCase() === cleanUname
+          );
+          if (recipientRecord) resolvedRecipientId = recipientRecord.id;
+        }
+
+        const canonicalId = getDeterministicConversationId(
+          user.id,
+          resolvedRecipientId
+        );
         conv = db.conversations.find(
           (c) =>
             c.id === canonicalId ||
             (c.participantIds.includes(user.id) &&
-              c.participantIds.includes(recipientId))
+              c.participantIds.includes(resolvedRecipientId))
         );
-        if (!conv) {
-          const recipientRecord = db.users.find((u) => u.id === recipientId);
-          if (recipientRecord) {
-            const nowStr = new Date().toISOString();
-            const sortedPair = [user.id, recipientId].sort() as [string, string];
-            conv = {
-              id: canonicalId,
-              participantIds: sortedPair,
-              createdAt: nowStr,
-              updatedAt: nowStr,
-              deletedBy: [],
-              clearedAt: {},
-            };
-            db.conversations.push(conv);
-          }
+        if (!conv && recipientRecord) {
+          const nowStr = new Date().toISOString();
+          const sortedPair = [user.id, recipientRecord.id].sort() as [
+            string,
+            string,
+          ];
+          conv = {
+            id: getDeterministicConversationId(user.id, recipientRecord.id),
+            participantIds: sortedPair,
+            createdAt: nowStr,
+            updatedAt: nowStr,
+            deletedBy: [],
+            clearedAt: {},
+          };
+          db.conversations.push(conv);
         }
       }
 

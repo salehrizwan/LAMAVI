@@ -12,7 +12,7 @@
       "bio": "",
       "avatarUrl": "",
       "createdAt": "2026-10-11T19:52:46.192+00:00",
-      "lastSeen": "2026-10-11T20:07:35.674+00:00",
+      "lastSeen": "2026-10-12T01:40:46.756+00:00",
       "isOnline": false,
       "usernameChangeTimestamps": [],
       "privacy": {
@@ -164,72 +164,6 @@
         "enterToSend": true,
         "autoDownloadImages": true
       }
-    },
-    {
-      "id": "usr_3e0945d2932aad42",
-      "fullName": "Mobile User A",
-      "username": "moba_45338",
-      "email": "moba_45338@gmail.com",
-      "passwordSalt": "sha256_client",
-      "passwordHash": "d3dec3f35387156495cbc21471313f87155f878f3435b693f50077c2be479033",
-      "recoveryCodeSalt": "sha256_client",
-      "recoveryCodeHash": "369ee4ef5731304945609cae21ab63df4b9705010db141c517198d35840c9149",
-      "bio": "",
-      "avatarUrl": "",
-      "createdAt": "2026-10-11T20:24:05.954+00:00",
-      "lastSeen": "2026-10-11T20:24:09.051+00:00",
-      "isOnline": true,
-      "usernameChangeTimestamps": [],
-      "privacy": {
-        "readReceipts": true,
-        "statusPrivacy": "everyone",
-        "whoCanContact": "everyone",
-        "lastSeenVisibility": "everyone",
-        "profilePicVisibility": "everyone"
-      },
-      "notifications": {
-        "previewText": true,
-        "soundEnabled": true,
-        "messageAlerts": true
-      },
-      "chatSettings": {
-        "fontSize": "medium",
-        "enterToSend": true,
-        "autoDownloadImages": true
-      }
-    },
-    {
-      "id": "usr_9012a996471f753a",
-      "fullName": "Mobile User B",
-      "username": "mobb_45338",
-      "email": "mobb_45338@gmail.com",
-      "passwordSalt": "sha256_client",
-      "passwordHash": "e8fa823a76f3aaf7068fd2068ba81d1fcb3b680bd854276ddc42d6139754240b",
-      "recoveryCodeSalt": "sha256_client",
-      "recoveryCodeHash": "7852f4f34271ff97a5105765f795faa8d7842c1668e12d13c9b666d6f6267977",
-      "bio": "",
-      "avatarUrl": "",
-      "createdAt": "2026-10-11T20:24:10.544+00:00",
-      "lastSeen": "2026-10-11T20:24:10.544+00:00",
-      "isOnline": true,
-      "usernameChangeTimestamps": [],
-      "privacy": {
-        "readReceipts": true,
-        "statusPrivacy": "everyone",
-        "whoCanContact": "everyone",
-        "lastSeenVisibility": "everyone",
-        "profilePicVisibility": "everyone"
-      },
-      "notifications": {
-        "previewText": true,
-        "soundEnabled": true,
-        "messageAlerts": true
-      },
-      "chatSettings": {
-        "fontSize": "medium",
-        "enterToSend": true,
-        "autoDownloadImages": true
-      }
     }
   ],
   "sessions": [
@@ -268,30 +202,6 @@
       "userId": "usr_b434fa3d10b0b186",
       "createdAt": "2026-10-11T12:29:42.679+00:00",
       "expiresAt": "2026-11-10T12:29:42.679+00:00"
-    },
-    {
-      "token": "lmv.usr_3e0945d2932aad42.e24d5ca0c70dbb1089c9cac584e8edca1576773a72b25ada",
-      "userId": "usr_3e0945d2932aad42",
-      "createdAt": "2026-10-11T20:24:05.954+00:00",
-      "expiresAt": "2026-11-10T20:24:05.955+00:00"
-    },
-    {
-      "token": "lmv.usr_3e0945d2932aad42.c033ac1f0247309b31a301e304c49554d399740590a5cf85",
-      "userId": "usr_3e0945d2932aad42",
-      "createdAt": "2026-10-11T20:24:07.607+00:00",
-      "expiresAt": "2026-11-10T20:24:07.607+00:00"
-    },
-    {
-      "token": "lmv.usr_3e0945d2932aad42.63290ec993f0296cccadf09c117bcd4c4e0d3981e00bd258",
-      "userId": "usr_3e0945d2932aad42",
-      "createdAt": "2026-10-11T20:24:09.051+00:00",
-      "expiresAt": "2026-11-10T20:24:09.051+00:00"
-    },
-    {
-      "token": "lmv.usr_9012a996471f753a.91e425ec0150fa0a79262ced7bae6b1d1246e6bb54ebc77b",
-      "userId": "usr_9012a996471f753a",
-      "createdAt": "2026-10-11T20:24:10.544+00:00",
-      "expiresAt": "2026-11-10T20:24:10.544+00:00"
     }
   ],
   "conversations": [
@@ -329,13 +239,24 @@
       "clearedAt": {}
     },
     {
-      "id": "conv_651520a96b54f2b0",
+      "id": "conv_f6dde9f74ab25626",
       "participantIds": [
-        "usr_3e0945d2932aad42",
-        "usr_9012a996471f753a"
+        "usr_055a7bef816c636d",
+        "usr_c6c728588e1acd4f"
       ],
-      "createdAt": "2026-10-11T20:24:12.049+00:00",
-      "updatedAt": "2026-10-11T20:24:14.600Z",
+      "createdAt": "2026-10-12T01:13:24.756+00:00",
+      "updatedAt": "2026-10-12T01:28:01.27+00:00",
+      "deletedBy": [],
+      "clearedAt": {}
+    },
+    {
+      "id": "conv_361fe29d03b18f4e",
+      "participantIds": [
+        "usr_b434fa3d10b0b186",
+        "usr_c6c728588e1acd4f"
+      ],
+      "createdAt": "2026-10-12T01:35:35.831+00:00",
+      "updatedAt": "2026-10-12T01:35:46.166+00:00",
       "deletedBy": [],
       "clearedAt": {}
     }
@@ -459,7 +380,8 @@
       "text": "hi",
       "createdAt": "2026-10-11T15:39:28.169+00:00",
       "expiresAt": "2026-10-18T15:39:28.169+00:00",
-      "status": "sent",
+      "status": "delivered",
+      "deliveredAt": "2026-10-12T01:38:22.025+00:00",
       "deletedFor": [],
       "deletedForEveryone": false
     },
@@ -472,7 +394,8 @@
       "text": "hi",
       "createdAt": "2026-10-11T17:58:52.57+00:00",
       "expiresAt": "2026-10-18T17:58:52.57+00:00",
-      "status": "sent",
+      "status": "delivered",
+      "deliveredAt": "2026-10-12T01:38:22.025+00:00",
       "deletedFor": [],
       "deletedForEveryone": false
     },
@@ -485,31 +408,35 @@
       "text": "ho",
       "createdAt": "2026-10-11T19:06:31.073+00:00",
       "expiresAt": "2026-10-18T19:06:31.073+00:00",
+      "status": "delivered",
+      "deliveredAt": "2026-10-12T01:38:22.025+00:00",
+      "deletedFor": [],
+      "deletedForEveryone": false
+    },
+    {
+      "id": "msg_1f981d4292770b34",
+      "clientTempId": "temp_1791768430799_to05ss",
+      "conversationId": "conv_f6dde9f74ab25626",
+      "senderId": "usr_c6c728588e1acd4f",
+      "recipientId": "usr_055a7bef816c636d",
+      "text": "hi",
+      "createdAt": "2026-10-12T01:28:01.27+00:00",
+      "expiresAt": "2026-10-19T01:28:01.27+00:00",
       "status": "sent",
       "deletedFor": [],
       "deletedForEveryone": false
     },
     {
-      "id": "msg_355c9dac082eea8a",
-      "conversationId": "conv_651520a96b54f2b0",
-      "senderId": "usr_3e0945d2932aad42",
-      "recipientId": "usr_9012a996471f753a",
-      "text": "Hello from mobile A!",
-      "createdAt": "2026-10-11T20:24:13.375+00:00",
-      "expiresAt": "2026-10-18T20:24:13.375+00:00",
-      "status": "sent",
-      "deletedFor": [],
-      "deletedForEveryone": false
-    },
-    {
-      "id": "msg_443d7df42d2425e5",
-      "conversationId": "conv_651520a96b54f2b0",
-      "senderId": "usr_9012a996471f753a",
-      "recipientId": "usr_3e0945d2932aad42",
-      "text": "Reply from mobile B!",
-      "createdAt": "2026-10-11T20:24:14.600Z",
-      "expiresAt": "2026-10-18T20:24:14.600Z",
-      "status": "sent",
+      "id": "msg_9e433bb475cf0c90",
+      "clientTempId": "temp_1791768895551_l0ubaj",
+      "conversationId": "conv_361fe29d03b18f4e",
+      "senderId": "usr_c6c728588e1acd4f",
+      "recipientId": "usr_b434fa3d10b0b186",
+      "text": "hi",
+      "createdAt": "2026-10-12T01:35:46.166+00:00",
+      "expiresAt": "2026-10-19T01:35:46.166+00:00",
+      "status": "delivered",
+      "deliveredAt": "2026-10-12T01:38:22.025+00:00",
       "deletedFor": [],
       "deletedForEveryone": false
     }
@@ -537,6 +464,18 @@
       "userId": "usr_3dba8c533cb10bb4",
       "contactUserId": "usr_b434fa3d10b0b186",
       "createdAt": "2026-10-11T15:39:34.713+00:00"
+    },
+    {
+      "id": "cnt_bcbf67ec32ae",
+      "userId": "usr_c6c728588e1acd4f",
+      "contactUserId": "usr_055a7bef816c636d",
+      "createdAt": "2026-10-12T01:13:21.576+00:00"
+    },
+    {
+      "id": "cnt_50c4e34d2d11",
+      "userId": "usr_c6c728588e1acd4f",
+      "contactUserId": "usr_b434fa3d10b0b186",
+      "createdAt": "2026-10-12T01:35:30.699+00:00"
     }
   ]
 }

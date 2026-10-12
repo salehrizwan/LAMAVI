@@ -25,16 +25,38 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
   const [searched, setSearched] = useState(false);
   const [result, setResult] = useState<UserProfile | null>(null);
   const [results, setResults] = useState<UserProfile[]>([]);
+  const [directoryUsers, setDirectoryUsers] = useState<UserProfile[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [addedContactIds, setAddedContactIds] = useState<Record<string, boolean>>({});
   const [confirmConnectUser, setConfirmConnectUser] = useState<UserProfile | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [fullScreenDp, setFullScreenDp] = useState<{ src: string; caption?: string } | null>(null);
 
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const targetQuery = query.trim();
-    if (!targetQuery) return;
+  // Load current registered accounts from Supabase when the modal opens so newly registered accounts are immediately discoverable
+  React.useEffect(() => {
+    if (!isOnline || !token) return;
+    fetch('/api/users/search?q=', {
+      credentials: 'same-origin',
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data && Array.isArray(data.results)) {
+          setDirectoryUsers(data.results);
+        }
+      })
+      .catch(() => {});
+  }, [token, isOnline]);
+
+  const executeSearch = async (rawQ: string) => {
+    const targetQuery = rawQ.trim();
+    if (!targetQuery) {
+      setSearched(false);
+      setResult(null);
+      setResults([]);
+      setErrorMsg(null);
+      return;
+    }
 
     if (!isOnline) {
       setErrorMsg('You are currently offline. Please connect to the internet to search and connect with users.');
@@ -43,16 +65,16 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
 
     setLoading(true);
     setErrorMsg(null);
-    setSearched(false);
-    setResult(null);
-    setResults([]);
 
     try {
       const res = await fetch(`/api/users/search?q=${encodeURIComponent(targetQuery)}`, {
+        credentials: 'same-origin',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        setResult(null);
+        setResults([]);
         setErrorMsg(data.error || 'Could not complete search.');
       } else {
         setResult(data.result || null);
@@ -66,6 +88,11 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
     }
   };
 
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await executeSearch(query);
+  };
+
   const handleConfirmConnect = async () => {
     if (!confirmConnectUser || !onAddContact) return;
     setConnecting(true);
@@ -77,6 +104,10 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
       setConnecting(false);
     }
   };
+
+  const secondaryResults = (searched || query.trim() ? results : directoryUsers).filter(
+    (u) => u.id !== result?.id
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4">
@@ -104,9 +135,21 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
               <input
                 type="text"
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setQuery(val);
+                  if (!val.trim()) {
+                    setSearched(false);
+                    setResult(null);
+                    setResults([]);
+                    setErrorMsg(null);
+                  }
+                }}
                 placeholder="Username, Gmail, or name..."
                 autoFocus
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
                 className="w-full h-11 pl-10 pr-4 rounded-xl bg-[#F8F9FA] border border-[#E5E5EA] focus:border-[#8E8E93] focus:bg-white text-sm text-[#1C1C1E] outline-none"
               />
             </div>
@@ -221,59 +264,59 @@ export const UserSearchModal: React.FC<UserSearchModalProps> = ({
             </div>
           )}
 
-          {results.length > 1 && (
+          {secondaryResults.length > 0 && (
             <div className="mt-4 space-y-2">
               <p className="text-[11px] font-semibold uppercase tracking-wider text-[#8E8E93] px-1">
-                Other Matching Accounts ({results.length - 1})
+                {result
+                  ? `Other Matching Accounts (${secondaryResults.length})`
+                  : `Registered LAMAVI Users (${secondaryResults.length})`}
               </p>
-              {results
-                .filter((u) => u.id !== result?.id)
-                .map((u) => {
-                  const isConnected = u.isContact || addedContactIds[u.id];
-                  return (
+              {secondaryResults.map((u) => {
+                const isConnected = u.isContact || addedContactIds[u.id];
+                return (
+                  <div
+                    key={u.id}
+                    className="p-3 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA] flex items-center justify-between gap-3"
+                  >
                     <div
-                      key={u.id}
-                      className="p-3 rounded-2xl bg-[#F8F9FA] border border-[#E5E5EA] flex items-center justify-between gap-3"
+                      onClick={() => setResult(u)}
+                      className="flex items-center gap-2.5 min-w-0 cursor-pointer"
                     >
-                      <div
-                        onClick={() => setResult(u)}
-                        className="flex items-center gap-2.5 min-w-0 cursor-pointer"
-                      >
-                        <Avatar
-                          src={u.avatarUrl}
-                          name={u.fullName}
-                          size="sm"
-                          isOnline={u.isOnline}
-                          showPresence
-                        />
-                        <div className="min-w-0">
-                          <p className="text-xs font-semibold text-[#1C1C1E] truncate">
-                            {u.fullName}
-                          </p>
-                          <p className="text-[11px] text-[#636366] truncate">@{u.username}</p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {!isConnected && onAddContact && (
-                          <button
-                            type="button"
-                            onClick={() => setConfirmConnectUser(u)}
-                            className="h-8 px-2.5 rounded-xl bg-white border border-[#D1D1D6] text-[#1C1C1E] text-[11px] font-semibold hover:bg-[#F2F2F7]"
-                          >
-                            Connect
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => onStartConversation(u)}
-                          className="h-8 px-3 rounded-xl bg-[#2C2C2E] text-white text-[11px] font-semibold hover:bg-[#3A3A3C]"
-                        >
-                          Message
-                        </button>
+                      <Avatar
+                        src={u.avatarUrl}
+                        name={u.fullName}
+                        size="sm"
+                        isOnline={u.isOnline}
+                        showPresence
+                      />
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-[#1C1C1E] truncate">
+                          {u.fullName}
+                        </p>
+                        <p className="text-[11px] text-[#636366] truncate">@{u.username}</p>
                       </div>
                     </div>
-                  );
-                })}
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {!isConnected && onAddContact && (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmConnectUser(u)}
+                          className="h-8 px-2.5 rounded-xl bg-white border border-[#D1D1D6] text-[#1C1C1E] text-[11px] font-semibold hover:bg-[#F2F2F7]"
+                        >
+                          Connect
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onStartConversation(u)}
+                        className="h-8 px-3 rounded-xl bg-[#2C2C2E] text-white text-[11px] font-semibold hover:bg-[#3A3A3C]"
+                      >
+                        Message
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
